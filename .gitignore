@@ -1,0 +1,10 @@
+workspace/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+*.egg-info/
+.streamlit/secrets.toml
