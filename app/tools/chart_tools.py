@@ -125,7 +125,13 @@ def _build_figure(
     color: str | None,
     title: str,
 ) -> go.Figure:
-    if chart_type == "bar":
+    if chart_type == "pie":
+        names = x
+        values = y if y is not None else (
+            df.select_dtypes(include="number").columns.tolist() or [df.columns[-1]]
+        )[0]
+        fig = px.pie(df, names=names, values=values, title=title)
+    elif chart_type == "bar":
         fig = px.bar(df, x=x, y=y, color=color, title=title)
     elif chart_type == "line":
         fig = px.line(df, x=x, y=y, color=color, title=title)
@@ -141,6 +147,8 @@ def _build_figure(
 
 def choose_chart_type(intent: str, columns_info: dict[str, Any] | None = None) -> str:
     intent_l = intent.lower()
+    if any(k in intent_l for k in ("pie", "donut", "share of", "proportion", "percentage breakdown")):
+        return "pie"
     if any(k in intent_l for k in ("distribution", "histogram", "spread")):
         return "histogram"
     if any(k in intent_l for k in ("over time", "trend", "timeseries", "time series")):

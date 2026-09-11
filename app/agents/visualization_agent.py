@@ -127,17 +127,23 @@ class VisualizationAgent:
 
         system = (
             "Return JSON {\"specs\":[...]} where each spec has: "
-            "chart_type (bar|line|scatter|histogram), title, "
+            "chart_type (bar|line|scatter|histogram|pie), title, "
             "aggregation optional {group_by, metric_column, agg}, "
             "x, y, color optional. "
             f"Use ONLY these exact column names: {cols}. "
             "Never invent column names like 'revenue' — use total_amount when that exists. "
             "metric_column and group_by must be non-null when aggregation is used. "
+            "If the user asks for a pie chart, set chart_type to pie. "
             "If the user asks for both category revenue and amount distribution, return TWO specs."
         )
         out = self.llm.chat_json(system, f"Request: {request}\nSchema: {schema}")
         if isinstance(out.get("specs"), list) and out["specs"]:
             specs = out["specs"]
+            # Honor explicit pie requests even if the model returned bar
+            if self._wants_pie(request):
+                for s in specs:
+                    if isinstance(s, dict) and (s.get("chart_type") or "").lower() in {"bar", "", "none"}:
+                        s["chart_type"] = "pie"
             # Ensure distribution chart is present when requested even if LLM omitted it
             if self._wants_distribution(request) and not any(
                 (s.get("chart_type") or "").lower() == "histogram" for s in specs if isinstance(s, dict)
@@ -151,7 +157,7 @@ class VisualizationAgent:
             return []
         req = request.lower()
         # Only reuse analysis output for visualization-oriented requests
-        if not any(k in req for k in ("visual", "chart", "plot", "graph", "show")):
+        if not any(k in req for k in ("visual", "chart", "plot", "graph", "show", "pie")):
             return []
 
         item = workspace.analysis_results[-1]
@@ -161,13 +167,13 @@ class VisualizationAgent:
         keys = list(records[0].keys())
         if len(keys) < 2:
             return []
-        # Typical aggregation shape: category + value — always bar for grouped analysis
         x = keys[0]
         y = "value" if "value" in keys else keys[1]
         title = "Revenue by Product Category" if "categor" in req else "Analysis Result"
+        chart_type = chart_tools.choose_chart_type(request)
         return [
             {
-                "chart_type": "bar",
+                "chart_type": chart_type,
                 "title": title,
                 "data_records": records,
                 "x": x,
@@ -179,6 +185,11 @@ class VisualizationAgent:
     def _wants_distribution(request: str) -> bool:
         req = request.lower()
         return "distribution" in req or "histogram" in req or "transaction amount" in req
+
+    @staticmethod
+    def _wants_pie(request: str) -> bool:
+        req = request.lower()
+        return any(k in req for k in ("pie", "donut", "share of", "proportion"))
 
     def _extra_distribution_specs(self, request: str, schema: dict[str, Any]) -> list[dict[str, Any]]:
         if not self._wants_distribution(request):
@@ -206,24 +217,26 @@ class VisualizationAgent:
         cat = self._resolve_column(cols, _CATEGORY_HINTS)
         amount = self._resolve_column(cols, _AMOUNT_HINTS)
         date = self._resolve_column(cols, _DATE_HINTS)
+        chart_type = chart_tools.choose_chart_type(request)
 
         want_revenue_by_cat = (
-            ("categor" in req and any(k in req for k in ("revenue", "visual", "chart", "show")))
+            ("categor" in req and any(k in req for k in ("revenue", "visual", "chart", "show", "pie")))
             or "revenue by category" in req
+            or self._wants_pie(request)
         )
         want_dist = "distribution" in req or "histogram" in req or "transaction amount" in req
 
         if want_revenue_by_cat and cat and amount:
             specs.append(
                 {
-                    "chart_type": "bar",
+                    "chart_type": chart_type if chart_type in {"bar", "pie"} else "bar",
                     "title": "Revenue by Product Category",
                     "aggregation": {"group_by": cat, "metric_column": amount, "agg": "sum"},
                     "x": cat,
                     "y": "value",
                 }
             )
-        if want_dist and amount:
+        if want_dist and amount and not self._wants_pie(request):
             specs.append(
                 {
                     "chart_type": "histogram",
@@ -240,7 +253,7 @@ class VisualizationAgent:
             if cat and amount:
                 specs.append(
                     {
-                        "chart_type": "bar",
+                        "chart_type": chart_type if chart_type in {"bar", "pie"} else "bar",
                         "title": f"{amount} by {cat}",
                         "aggregation": {"group_by": cat, "metric_column": amount, "agg": "sum"},
                         "x": cat,

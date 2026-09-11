@@ -30,21 +30,24 @@ st.set_page_config(
 
 ensure_workspace()
 
-EXAMPLES = [
+# Numbered progression — run these in order
+STEP_EXAMPLES = [
     ("Create 10k e-commerce orders", "Create a dataset of 10,000 fictional e-commerce orders."),
     ("Revenue by category", "How much revenue does each product category generate?"),
     ("Find anomalies", "Find anomalous transactions."),
     ("Visualize revenue by category", "Show me a visualization of revenue by category."),
-    (
-        "Full acceptance workflow",
-        (
-            "Create a synthetic e-commerce dataset with 10,000 orders. "
-            "Tell me which product categories generate the most revenue, "
-            "identify anomalous transactions, and create visualizations showing "
-            "revenue by category and the distribution of transaction amounts."
-        ),
-    ),
 ]
+
+# Alternative: one-shot instead of steps 1–4
+FULL_WORKFLOW_EXAMPLE = (
+    "Full acceptance workflow",
+    (
+        "Create a synthetic e-commerce dataset with 10,000 orders. "
+        "Tell me which product categories generate the most revenue, "
+        "identify anomalous transactions, and create visualizations showing "
+        "revenue by category and the distribution of transaction amounts."
+    ),
+)
 
 CUSTOM_CSS = """
 <style>
@@ -98,8 +101,138 @@ CUSTOM_CSS = """
     }
     .msg-user { background: #eef6f3; border: 1px solid #c5ddd4; }
     .msg-assistant { background: #f7f5f1; border: 1px solid #e4e0d8; }
+    .example-arrow {
+        text-align: center;
+        color: #6b7c76;
+        font-size: 0.95rem;
+        line-height: 1;
+        margin: -0.15rem 0 0.15rem 0;
+        opacity: 0.85;
+    }
+    .example-or {
+        text-align: center;
+        color: #6b7c76;
+        font-size: 0.8rem;
+        letter-spacing: 0.08em;
+        margin: 0.65rem 0 0.55rem 0;
+        text-transform: lowercase;
+    }
+    .tour-popup {
+        position: relative;
+        background: linear-gradient(145deg, #1a2e28 0%, #2d4a42 100%);
+        color: #f4f1ea;
+        border-radius: 12px;
+        padding: 0.95rem 1.1rem 1rem 1.1rem;
+        margin: 0.35rem 0 0.85rem 0;
+        box-shadow: 0 10px 28px rgba(26, 46, 40, 0.28);
+        border: 1px solid #3d6b5e;
+    }
+    .tour-popup::after {
+        content: "";
+        position: absolute;
+        bottom: -9px;
+        left: var(--tour-pointer, 8%);
+        width: 0;
+        height: 0;
+        border-left: 9px solid transparent;
+        border-right: 9px solid transparent;
+        border-top: 9px solid #2d4a42;
+    }
+    .tour-popup .tour-step {
+        display: inline-block;
+        background: #c5ddd4;
+        color: #1a2e28;
+        border-radius: 999px;
+        padding: 0.1rem 0.55rem;
+        font-size: 0.75rem;
+        font-weight: 700;
+        margin-bottom: 0.45rem;
+    }
+    .tour-popup h4 {
+        color: #f4f1ea !important;
+        margin: 0 0 0.35rem 0;
+        font-size: 1.02rem;
+    }
+    .tour-popup p {
+        margin: 0;
+        opacity: 0.92;
+        font-size: 0.9rem;
+        line-height: 1.45;
+    }
+    .tour-popup .tour-agent {
+        margin-top: 0.55rem;
+        font-size: 0.8rem;
+        opacity: 0.8;
+    }
 </style>
 """
+
+TOUR_STEPS = [
+    {
+        "tab": "Progress",
+        "pointer": "8%",
+        "title": "Progress",
+        "agent": "Orchestrator / Root Agent",
+        "body": (
+            "Watch the execution plan and live hand-offs here. The orchestrator "
+            "interprets your request, delegates to specialists, and tracks each step — "
+            "it does not invent numbers itself."
+        ),
+    },
+    {
+        "tab": "Dataset",
+        "pointer": "22%",
+        "title": "Dataset",
+        "agent": "Dataset Agent",
+        "body": (
+            "Schema, row counts, and profiles for the active dataset. The Dataset Agent "
+            "builds a structured spec, then deterministic code generates or loads the data "
+            "into the shared workspace."
+        ),
+    },
+    {
+        "tab": "Analysis",
+        "pointer": "38%",
+        "title": "Analysis",
+        "agent": "Analysis / Question Agent",
+        "body": (
+            "Answers grounded in real computation. The agent plans a query, DuckDB/pandas "
+            "execute it, then the LLM only explains the returned numbers — never fabricates them."
+        ),
+    },
+    {
+        "tab": "Anomalies",
+        "pointer": "54%",
+        "title": "Anomalies",
+        "agent": "Anomaly Detection Agent",
+        "body": (
+            "Unusual rows from statistical/ML methods (IQR, Z-score, Isolation Forest). "
+            "The agent chooses a method; the outlier labels come from the calculation, "
+            "then are explained in plain language."
+        ),
+    },
+    {
+        "tab": "Charts",
+        "pointer": "70%",
+        "title": "Charts",
+        "agent": "Visualization Agent",
+        "body": (
+            "Data-driven Plotly charts from a structured viz spec. The LLM picks chart type "
+            "and columns; a deterministic renderer draws the figure from actual query/dataset values."
+        ),
+    },
+    {
+        "tab": "Agent log",
+        "pointer": "88%",
+        "title": "Agent log",
+        "agent": "Validation / Critic + full history",
+        "body": (
+            "Structured messages between agents: what each received, did, and produced. "
+            "The Validation Agent checks grounding — dataset exists, numbers came from tools, "
+            "and charts reference real data — before the final answer is trusted."
+        ),
+    },
+]
 
 def _fresh_state() -> dict:
     return {
@@ -107,7 +240,13 @@ def _fresh_state() -> dict:
         "events": [],
         "messages": [],
         "busy": False,
+        "tour_active": True,
+        "tour_step": 0,
     }
+
+
+# Only app-owned keys — never delete Streamlit widget keys in the same click handler.
+_APP_KEYS = ("workspace", "events", "messages", "busy", "pending_prompt", "flash", "tour_active", "tour_step")
 
 
 def init_session() -> None:
@@ -117,15 +256,31 @@ def init_session() -> None:
 
 
 def hard_reset_session() -> None:
-    """Delete all session + widget state, then recreate app state.
-
-    Streamlit keeps widget values in session_state; assigning empty lists alone
-    is not enough to clear the visible conversation/results reliably.
-    """
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.session_state.update(_fresh_state())
+    """Clear conversation + results without destroying active widget keys mid-click."""
+    fresh = _fresh_state()
+    for key in _APP_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state.workspace = fresh["workspace"]
+    st.session_state.events = fresh["events"]
+    st.session_state.messages = fresh["messages"]
+    st.session_state.busy = False
     st.session_state.flash = "Workspace reset — conversation and results cleared."
+
+
+def apply_reset_if_requested() -> bool:
+    """Honor ?reset=1 from the Reset link/button. Returns True if a reset ran."""
+    try:
+        reset_flag = st.query_params.get("reset")
+    except Exception:  # noqa: BLE001
+        reset_flag = None
+    if reset_flag != "1":
+        return False
+    hard_reset_session()
+    try:
+        st.query_params.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def status_class(status: str) -> str:
@@ -140,16 +295,29 @@ def status_class(status: str) -> str:
 
 def render_header(ws: SharedWorkspace) -> None:
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="mas-banner">
-          <h1>Data Intelligence</h1>
-          <p>Multi-agent workspace — orchestrator delegates to dataset, analysis,
-          anomaly, visualization, and validation agents. Numbers come from tools, not the LLM.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    top_l, top_r = st.columns([4, 1])
+    with top_l:
+        st.markdown(
+            """
+            <div class="mas-banner">
+              <h1>Data Intelligence</h1>
+              <p>Multi-agent workspace — orchestrator delegates to dataset, analysis,
+              anomaly, visualization, and validation agents. Numbers come from tools, not the LLM.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_r:
+        st.write("")
+        # link_button navigates to ?reset=1 — more reliable than widget on_click for full clears
+        st.link_button(
+            "Reset workspace",
+            url="?reset=1",
+            use_container_width=True,
+            type="primary",
+            help="Clear conversation, dataset, analyses, anomalies, charts, and agent log",
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Status", ws.task_status)
     c2.metric("Dataset rows", (ws.dataset or {}).get("row_count") or 0)
@@ -256,13 +424,18 @@ def render_charts_panel(ws: SharedWorkspace) -> None:
     if not ws.visualizations:
         st.info("No visualizations yet.")
         return
-    for viz in ws.visualizations:
+    for i, viz in enumerate(ws.visualizations):
+        chart_id = viz.get("id") or f"idx_{i}"
         st.markdown(f"#### {viz.get('title')} (`{viz.get('chart_type')}`)")
         fig_json = viz.get("plotly_json")
         if fig_json:
             payload = json.dumps(fig_json) if isinstance(fig_json, dict) else fig_json
             fig = pio.from_json(payload)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=f"plotly_{chart_id}_{i}_{st.session_state.get('tour_step', 0)}_{bool(st.session_state.get('tour_active'))}",
+            )
         elif viz.get("html_path"):
             st.caption(f"Chart artifact: `{viz['html_path']}`")
         st.caption(f"{viz.get('n_points')} data points · grounded={viz.get('grounded')}")
@@ -273,6 +446,57 @@ def render_history_panel(ws: SharedWorkspace) -> None:
         st.info("No agent history yet.")
         return
     st.json(ws.agent_history)
+
+
+def render_tour_popup(step_index: int) -> None:
+    """Numbered popup callout that points up toward the active results tab."""
+    step = TOUR_STEPS[step_index]
+    n = len(TOUR_STEPS)
+    st.markdown(
+        f"""
+        <div class="tour-popup" style="--tour-pointer: {step["pointer"]};">
+          <div class="tour-step">Step {step_index + 1} of {n}</div>
+          <h4>{step["title"]}</h4>
+          <p>{step["body"]}</p>
+          <div class="tour-agent">Agent focus: <strong>{step["agent"]}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1.2])
+    with c1:
+        if st.button("Back", use_container_width=True, disabled=step_index <= 0, key="tour_back"):
+            st.session_state.tour_step = max(0, step_index - 1)
+            st.rerun()
+    with c2:
+        if st.button(
+            "Next" if step_index < n - 1 else "Done",
+            use_container_width=True,
+            type="primary",
+            key="tour_next",
+        ):
+            if step_index >= n - 1:
+                st.session_state.tour_active = False
+            else:
+                st.session_state.tour_step = step_index + 1
+            st.rerun()
+    with c3:
+        if st.button("Skip tour", use_container_width=True, key="tour_skip"):
+            st.session_state.tour_active = False
+            st.rerun()
+    with c4:
+        st.caption(f"Tab → **{step['tab']}**")
+
+
+def section_help(title: str, agent: str, body: str) -> None:
+    """Inline ? popover for each results section."""
+    head, tip = st.columns([6, 1])
+    with head:
+        st.markdown(f"#### {title}")
+    with tip:
+        with st.popover("?"):
+            st.markdown(f"**{agent}**")
+            st.write(body)
 
 
 def render_conversation(messages: list[dict]) -> None:
@@ -318,8 +542,8 @@ def run_request(prompt: str) -> None:
 
 def main() -> None:
     init_session()
+    apply_reset_if_requested()
 
-    # Handle reset BEFORE any main-panel render so stale UI cannot paint.
     with st.sidebar:
         st.markdown("### Workspace")
         ws_preview: SharedWorkspace = st.session_state.workspace
@@ -331,10 +555,7 @@ def main() -> None:
         )
         llm = LLMClient()
         st.caption("LLM: " + ("connected" if llm.available else "offline heuristics"))
-
-        if st.button("Reset workspace", use_container_width=True, type="primary", key="reset_workspace_btn"):
-            hard_reset_session()
-            st.rerun()
+        st.link_button("Reset workspace", url="?reset=1", use_container_width=True, type="primary")
 
         st.divider()
         st.markdown("### Load CSV")
@@ -359,12 +580,24 @@ def main() -> None:
 
         st.divider()
         st.markdown("### Try an example")
+        st.caption(
+            "Steps don’t have to run in order, but create or load a dataset first "
+            "(step 1) so analysis, anomalies, and charts have data to work with — "
+            "or use the full workflow instead."
+        )
         pending_from_example: str | None = None
-        for label, prompt in EXAMPLES:
-            if st.button(label, use_container_width=True, key=f"example_{label}"):
+        for i, (label, prompt) in enumerate(STEP_EXAMPLES, start=1):
+            if st.button(f"{i}. {label}", use_container_width=True, key=f"example_step_{i}"):
                 pending_from_example = prompt
+            if i < len(STEP_EXAMPLES):
+                st.markdown('<div class="example-arrow">↓</div>', unsafe_allow_html=True)
 
-    # Re-read after possible sidebar mutations
+        st.markdown('<div class="example-or">———— or ————</div>', unsafe_allow_html=True)
+        full_label, full_prompt = FULL_WORKFLOW_EXAMPLE
+        if st.button(full_label, use_container_width=True, key="example_full_workflow"):
+            pending_from_example = full_prompt
+
+    # Always bind panels to the latest session_state after callbacks (e.g. reset on_click)
     ws: SharedWorkspace = st.session_state.workspace
     render_header(ws)
 
@@ -377,7 +610,7 @@ def main() -> None:
     with left:
         st.markdown("### Conversation")
         with st.container(height=520):
-            render_conversation(st.session_state.messages)
+            render_conversation(list(st.session_state.get("messages") or []))
 
         prompt = st.chat_input("Ask the multi-agent system…")
         if pending_from_example:
@@ -387,19 +620,78 @@ def main() -> None:
             st.rerun()
 
     with right:
-        st.markdown("### Results workspace")
-        tabs = st.tabs(["Progress", "Dataset", "Analysis", "Anomalies", "Charts", "Agent log"])
+        title_col, tour_col = st.columns([3.2, 1.3])
+        with title_col:
+            st.markdown("### Results workspace")
+        with tour_col:
+            if st.button(
+                "Agent tour",
+                use_container_width=True,
+                key="start_agent_tour",
+                help="Numbered walkthrough of each results tab and its agent",
+            ):
+                st.session_state.tour_active = True
+                st.session_state.tour_step = 0
+                st.rerun()
+
+        tour_active = bool(st.session_state.get("tour_active"))
+        tour_step = int(st.session_state.get("tour_step") or 0)
+        tour_step = max(0, min(tour_step, len(TOUR_STEPS) - 1))
+        st.session_state.tour_step = tour_step
+
+        if tour_active:
+            render_tour_popup(tour_step)
+
+        tab_labels = [s["tab"] for s in TOUR_STEPS]
+        default_tab = TOUR_STEPS[tour_step]["tab"] if tour_active else "Progress"
+        # Remount tabs when the tour step changes so the pointed tab becomes active
+        tabs = st.tabs(
+            tab_labels,
+            default=default_tab,
+            key=f"results_tabs_tour_{tour_step}" if tour_active else "results_tabs_main",
+        )
+
         with tabs[0]:
-            render_progress(st.session_state.events)
+            section_help(
+                "Progress",
+                TOUR_STEPS[0]["agent"],
+                TOUR_STEPS[0]["body"],
+            )
+            render_progress(list(st.session_state.get("events") or []))
         with tabs[1]:
+            section_help(
+                "Dataset",
+                TOUR_STEPS[1]["agent"],
+                TOUR_STEPS[1]["body"],
+            )
             render_dataset_panel(ws)
         with tabs[2]:
+            section_help(
+                "Analysis",
+                TOUR_STEPS[2]["agent"],
+                TOUR_STEPS[2]["body"],
+            )
             render_analysis_panel(ws)
         with tabs[3]:
+            section_help(
+                "Anomalies",
+                TOUR_STEPS[3]["agent"],
+                TOUR_STEPS[3]["body"],
+            )
             render_anomaly_panel(ws)
         with tabs[4]:
+            section_help(
+                "Charts",
+                TOUR_STEPS[4]["agent"],
+                TOUR_STEPS[4]["body"],
+            )
             render_charts_panel(ws)
         with tabs[5]:
+            section_help(
+                "Agent log",
+                TOUR_STEPS[5]["agent"],
+                TOUR_STEPS[5]["body"],
+            )
             render_history_panel(ws)
 
 
