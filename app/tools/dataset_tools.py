@@ -103,9 +103,12 @@ def create_ecommerce_orders(
     )
 
     if extra_columns:
-        for col, spec in extra_columns.items():
+        normalized = _normalize_columns_spec(extra_columns) or {}
+        for col, spec in normalized.items():
             if col in df.columns:
                 continue
+            if not isinstance(spec, dict):
+                spec = {"type": str(spec) if spec else "string"}
             dtype = (spec or {}).get("type", "string")
             if dtype in ("int", "integer"):
                 df[col] = rng.integers(0, 100, size=n_rows)
@@ -207,6 +210,29 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
     return stats
 
 
+def _normalize_columns_spec(columns: Any) -> dict[str, Any] | None:
+    """Accept dict or list column specs from the LLM; always return dict[name] -> spec."""
+    if not columns:
+        return None
+    if isinstance(columns, dict):
+        return columns
+    if isinstance(columns, list):
+        out: dict[str, Any] = {}
+        for item in columns:
+            if isinstance(item, str):
+                out[item] = {"type": "string"}
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("column") or item.get("field")
+                if not name:
+                    continue
+                col_spec = {k: v for k, v in item.items() if k not in {"name", "column", "field"}}
+                if "type" not in col_spec:
+                    col_spec["type"] = "string"
+                out[str(name)] = col_spec
+        return out or None
+    return None
+
+
 def generate_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Create a dataset from an LLM-produced structured specification.
 
@@ -216,32 +242,50 @@ def generate_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "n_rows": 10000,
         "template": "ecommerce_orders" | "generic",
         "seed": 42,
-        "columns": {"col": {"type": "float"}}  # used for generic
+        "columns": {"col": {"type": "float"}}  # or list[{name, type}] from LLM
       }
     """
     template = (spec.get("template") or "ecommerce_orders").lower()
     n_rows = int(spec.get("n_rows") or spec.get("rows") or 1000)
     seed = int(spec.get("seed") or 42)
     name = spec.get("name") or _slug(template)
+    columns = _normalize_columns_spec(spec.get("columns"))
 
     if "e-commerce" in template or "ecommerce" in template or "order" in template:
+        # Ecommerce generator already has a full schema; only pass true extras.
+        builtin = {
+            "order_id",
+            "customer_id",
+            "order_date",
+            "product_category",
+            "product_name",
+            "quantity",
+            "unit_price",
+            "total_amount",
+            "state",
+            "payment_method",
+            "is_returned",
+        }
+        extras = {k: v for k, v in (columns or {}).items() if k not in builtin} or None
         return create_ecommerce_orders(
             n_rows=n_rows,
             seed=seed,
             name=name,
-            extra_columns=spec.get("columns"),
+            extra_columns=extras,
         )
 
     # Generic fallback: simple tabular data
     ensure_workspace()
     rng = np.random.default_rng(seed)
-    columns = spec.get("columns") or {
+    columns = columns or {
         "id": {"type": "int"},
         "value": {"type": "float"},
         "category": {"type": "string"},
     }
     data: dict[str, Any] = {}
     for col, col_spec in columns.items():
+        if not isinstance(col_spec, dict):
+            col_spec = {"type": str(col_spec) if col_spec else "string"}
         dtype = (col_spec or {}).get("type", "string")
         if dtype in ("int", "integer"):
             data[col] = rng.integers(0, 10_000, size=n_rows)

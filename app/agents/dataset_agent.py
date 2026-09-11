@@ -86,7 +86,10 @@ class DatasetAgent:
         system = (
             "You produce JSON dataset specifications for a deterministic generator. "
             "Never invent row values. Return JSON with keys: name, n_rows, template "
-            "(ecommerce_orders|generic), seed, columns (optional). "
+            "(ecommerce_orders|generic), seed. "
+            "For ecommerce_orders do NOT include a columns field — the generator has a fixed schema. "
+            "Only include columns for template=generic, as an object "
+            '{"col_name": {"type": "string|int|float|bool"}} — never as a list. '
             "Prefer template=ecommerce_orders for e-commerce / orders / transactions."
         )
         llm_out = self.llm.chat_json(system, f"User request: {user_text}\nHint n_rows={n_rows}")
@@ -102,14 +105,20 @@ class DatasetAgent:
                 "seed": 42,
             }
 
+        template = llm_out.get("template") or "ecommerce_orders"
         spec = {
             "name": llm_out.get("name") or "dataset",
             "n_rows": int(llm_out.get("n_rows") or n_rows),
-            "template": llm_out.get("template") or "ecommerce_orders",
+            "template": template,
             "seed": int(llm_out.get("seed") or 42),
         }
-        if llm_out.get("columns"):
-            spec["columns"] = llm_out["columns"]
+        # Ignore columns for ecommerce templates; normalize otherwise
+        if llm_out.get("columns") and "ecommerce" not in str(template).lower() and "order" not in str(template).lower():
+            from app.tools.dataset_tools import _normalize_columns_spec
+
+            normalized = _normalize_columns_spec(llm_out["columns"])
+            if normalized:
+                spec["columns"] = normalized
         return spec
 
     def _load_csv(self, message: AgentMessage, workspace: SharedWorkspace) -> AgentResult:
