@@ -23,7 +23,7 @@ from app.state import SharedWorkspace, ensure_workspace
 
 st.set_page_config(
     page_title="Data Intelligence MAS",
-    page_icon="◈",
+    page_icon=str(ROOT / ".streamlit" / "favicon.ico"),
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -163,6 +163,23 @@ CUSTOM_CSS = """
         margin-top: 0.55rem;
         font-size: 0.8rem;
         opacity: 0.8;
+    }
+    .site-footer {
+        margin-top: 2.5rem;
+        padding: 1.35rem 1rem 1.1rem 1rem;
+        border-top: 1px solid #e4e0d8;
+        text-align: center;
+        color: #5a6b64;
+        font-size: 0.88rem;
+        line-height: 1.65;
+    }
+    .site-footer a {
+        color: #1a2e28;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+    }
+    .site-footer a:hover {
+        color: #2d4a42;
     }
 </style>
 """
@@ -499,6 +516,20 @@ def section_help(title: str, agent: str, body: str) -> None:
             st.write(body)
 
 
+def render_footer() -> None:
+    st.markdown(
+        """
+        <footer class="site-footer">
+          <div>Email: <a href="mailto:hello@wesamtechnologies.com">hello@wesamtechnologies.com</a></div>
+          <div>© Copyright 2026</div>
+          <div>Wesam Technologies LLC</div>
+          <div><a href="https://wesamtechnologies.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a></div>
+        </footer>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_conversation(messages: list[dict]) -> None:
     if not messages:
         st.caption("Ask in natural language, or pick an example from the sidebar.")
@@ -693,6 +724,8 @@ def main() -> None:
                 TOUR_STEPS[5]["body"],
             )
             render_history_panel(ws)
+
+    render_footer()
 
 
 if __name__ == "__main__":
