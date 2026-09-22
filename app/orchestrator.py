@@ -224,7 +224,9 @@ class Orchestrator:
             "action, parameters, rationale. "
             "Do NOT include heavy computation in the orchestrator. "
             "Only include agents needed for the request. "
-            "Typical actions: create_dataset, answer_question, detect_anomalies, create_visualization, validate_all."
+            "Typical actions: create_dataset, answer_question, detect_anomalies, create_visualization, validate_all. "
+            "For detect_anomalies, parameters.method MUST be one of: iqr, zscore, isolation_forest, auto "
+            "(use auto when unsure; never invent method names like 'statistical')."
         )
         has_dataset = workspace.dataset is not None
         user = f"User request: {user_request}\nDataset already loaded: {has_dataset}"

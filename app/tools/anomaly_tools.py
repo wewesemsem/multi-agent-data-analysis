@@ -14,12 +14,43 @@ from app.tools.query_tools import _jsonify
 
 Method = Literal["iqr", "zscore", "isolation_forest", "auto"]
 
+_VALID_METHODS = frozenset({"iqr", "zscore", "isolation_forest", "auto"})
+
+# LLM planners often invent near-synonyms; map them before failing.
+_METHOD_ALIASES: dict[str, Method] = {
+    "statistical": "auto",
+    "stats": "auto",
+    "statistic": "auto",
+    "statistics": "auto",
+    "outlier": "auto",
+    "outliers": "auto",
+    "ml": "isolation_forest",
+    "isolation": "isolation_forest",
+    "iforest": "isolation_forest",
+    "isolationforest": "isolation_forest",
+    "z-score": "zscore",
+    "z_score": "zscore",
+    "z": "zscore",
+}
+
+
+def normalize_method(method: str | None) -> Method:
+    """Map free-form / LLM method names onto the supported set."""
+    if method is None or not str(method).strip():
+        return "auto"
+    key = str(method).strip().lower().replace(" ", "_")
+    if key in _VALID_METHODS:
+        return key  # type: ignore[return-value]
+    if key in _METHOD_ALIASES:
+        return _METHOD_ALIASES[key]
+    return "auto"
+
 
 def detect_anomalies(
     meta: dict[str, Any],
     *,
     column: str | None = None,
-    method: Method = "auto",
+    method: Method | str = "auto",
     z_threshold: float = 3.0,
     iqr_multiplier: float = 1.5,
     contamination: float = 0.02,
@@ -40,6 +71,7 @@ def detect_anomalies(
         raise ValueError(f"Column '{column}' is not numeric.")
 
     series = df[column].astype(float)
+    method = normalize_method(method)
     chosen = method
     if method == "auto":
         # Skewed financial data → IQR; otherwise z-score; IsolationForest if many dims requested later

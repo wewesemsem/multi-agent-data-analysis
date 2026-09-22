@@ -52,6 +52,16 @@ def test_anomaly_iqr_grounded():
     assert result["n_anomalies"] > 0
 
 
+def test_anomaly_method_alias_statistical():
+    """LLM planners often pass method='statistical'; map it instead of failing."""
+    assert anomaly_tools.normalize_method("statistical") == "auto"
+    meta = dataset_tools.create_ecommerce_orders(n_rows=500, seed=4)
+    result = anomaly_tools.detect_anomalies(meta, column="total_amount", method="statistical")
+    assert result["grounded"] is True
+    assert result["method"] in {"iqr", "zscore"}
+    assert result["n_anomalies"] >= 0
+
+
 def test_chart_render_from_aggregation():
     meta = dataset_tools.create_ecommerce_orders(n_rows=300, seed=3)
     chart = chart_tools.render_chart(

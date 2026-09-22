@@ -35,7 +35,7 @@ class AnomalyAgent:
             result = anomaly_tools.detect_anomalies(
                 workspace.dataset,
                 column=params.get("column"),
-                method=params.get("method") or "auto",
+                method=anomaly_tools.normalize_method(params.get("method")),
                 z_threshold=float(params.get("z_threshold") or 3.0),
                 iqr_multiplier=float(params.get("iqr_multiplier") or 1.5),
                 contamination=float(params.get("contamination") or 0.02),
@@ -78,12 +78,16 @@ class AnomalyAgent:
 
     def _resolve_params(self, parameters: dict[str, Any], workspace: SharedWorkspace) -> dict[str, Any]:
         if parameters.get("column") and parameters.get("method"):
-            return parameters
+            return {
+                **parameters,
+                "method": anomaly_tools.normalize_method(parameters.get("method")),
+            }
         schema = workspace.dataset.get("schema", {})
         system = (
             "Choose anomaly detection parameters. Return JSON: "
             '{"column":"...","method":"iqr|zscore|isolation_forest|auto"}. '
-            "Prefer amount/total columns for transactions. Use iqr for skewed spend data."
+            "Prefer amount/total columns for transactions. Use iqr for skewed spend data. "
+            "method MUST be exactly one of: iqr, zscore, isolation_forest, auto."
         )
         out = self.llm.chat_json(system, f"Request params: {parameters}\nSchema: {schema}")
         if out.get("_offline") or out.get("_fallback") or "column" not in out:
@@ -94,11 +98,13 @@ class AnomalyAgent:
             )
             return {
                 "column": parameters.get("column") or column,
-                "method": parameters.get("method") or "auto",
+                "method": anomaly_tools.normalize_method(parameters.get("method") or "auto"),
             }
         return {
             "column": parameters.get("column") or out.get("column"),
-            "method": parameters.get("method") or out.get("method") or "auto",
+            "method": anomaly_tools.normalize_method(
+                parameters.get("method") or out.get("method") or "auto"
+            ),
             **{k: parameters[k] for k in parameters if k not in {"column", "method"}},
         }
 
