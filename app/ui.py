@@ -20,6 +20,7 @@ from app.llm import LLMClient
 from app.messages import AgentMessage
 from app.orchestrator import Orchestrator
 from app.state import SharedWorkspace, ensure_workspace
+from app.tools import chart_tools, dataset_tools, eda_tools, query_tools
 
 st.set_page_config(
     page_title="Data Intelligence MAS",
@@ -49,24 +50,75 @@ FULL_WORKFLOW_EXAMPLE = (
     ),
 )
 
+# Natural-language demos — routed through the orchestrator to real agents
+TIER0_DEMOS = [
+    {
+        "key": "eda",
+        "title": "Explore the data",
+        "plain": "Links between columns, blank values, and typical ranges",
+        "jargon": "EDA · correlation · missingness · quantiles",
+        "agents": "Analysis Agent · Dataset Agent",
+        "prompt": (
+            "Explore the data — show how columns relate, missing values, and typical ranges."
+        ),
+    },
+    {
+        "key": "aggs",
+        "title": "Summarize by category",
+        "plain": "Spread, unique customers, and percent of revenue",
+        "jargon": "Aggs · std · nunique · pct",
+        "agents": "Analysis Agent",
+        "prompt": (
+            "For each product category, show the spread of order totals, "
+            "how many unique customers, and each category's percent share of revenue."
+        ),
+    },
+    {
+        "key": "charts",
+        "title": "Show box, heat, and dual charts",
+        "plain": "Three chart styles for the same dataset",
+        "jargon": "Charts · box · heatmap · dual_axis",
+        "agents": "Visualization Agent",
+        "prompt": (
+            "Create a box plot of order amounts by category, a heatmap of how numeric "
+            "columns relate, and a dual-axis chart of revenue and order count by category."
+        ),
+    },
+    {
+        "key": "all",
+        "title": "Run all of the above",
+        "plain": "Exploration, summaries, and new charts in one go",
+        "jargon": "EDA + Aggs + Charts",
+        "agents": "Dataset · Analysis · Visualization",
+        "prompt": (
+            "Explore the data — show how columns relate, missing values, and typical ranges. "
+            "For each product category, show the spread of order totals, how many unique customers, "
+            "and each category's percent share of revenue. "
+            "Create a box plot of order amounts by category, a heatmap of how numeric columns relate, "
+            "and a dual-axis chart of revenue and order count by category."
+        ),
+    },
+]
+
 CUSTOM_CSS = """
 <style>
     .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
     div[data-testid="stMetric"] {
-        background: #f7f5f1;
-        border: 1px solid #e4e0d8;
+        background: #1a2420;
+        border: 1px solid #2d3f38;
         border-radius: 10px;
         padding: 0.75rem 1rem;
     }
     .mas-banner {
-        background: linear-gradient(135deg, #1a2e28 0%, #2d4a42 55%, #3d6b5e 100%);
-        color: #f4f1ea;
+        background: linear-gradient(135deg, #0f1a16 0%, #1a2e28 55%, #243f36 100%);
+        color: #e6eeea;
         padding: 1.25rem 1.5rem;
         border-radius: 14px;
         margin-bottom: 1rem;
+        border: 1px solid #2d4a42;
     }
     .mas-banner h1 {
-        color: #f4f1ea !important;
+        color: #e6eeea !important;
         font-size: 1.6rem;
         margin: 0 0 0.35rem 0;
         font-weight: 650;
@@ -74,9 +126,9 @@ CUSTOM_CSS = """
     .mas-banner p { margin: 0; opacity: 0.85; font-size: 0.95rem; }
     .agent-chip {
         display: inline-block;
-        background: #eef6f3;
-        color: #1a2e28;
-        border: 1px solid #c5ddd4;
+        background: #243f36;
+        color: #c5ddd4;
+        border: 1px solid #3d6b5e;
         border-radius: 999px;
         padding: 0.15rem 0.65rem;
         margin: 0.15rem 0.25rem 0.15rem 0;
@@ -89,21 +141,70 @@ CUSTOM_CSS = """
         font-size: 0.8rem;
         font-weight: 600;
     }
-    .status-idle { background: #eee; color: #555; }
-    .status-running { background: #fff3cd; color: #856404; }
-    .status-ok { background: #d4edda; color: #155724; }
-    .status-warn { background: #f8d7da; color: #721c24; }
+    .status-idle { background: #2a3330; color: #b0bbb6; }
+    .status-running { background: #3d3420; color: #f0d78c; }
+    .status-ok { background: #1e3d2f; color: #8fd4a8; }
+    .status-warn { background: #3d2226; color: #f0a0a8; }
     .msg-user, .msg-assistant {
         border-radius: 12px;
-        padding: 0.75rem 1rem;
-        margin: 0.5rem 0;
-        white-space: pre-wrap;
+        padding: 0.85rem 1.05rem;
+        margin: 0.55rem 0 0.85rem 0;
+        color: #e6eeea;
     }
-    .msg-user { background: #eef6f3; border: 1px solid #c5ddd4; }
-    .msg-assistant { background: #f7f5f1; border: 1px solid #e4e0d8; }
+    .msg-user {
+        background: #1e332c;
+        border: 1px solid #3d6b5e;
+        white-space: pre-wrap;
+        line-height: 1.45;
+    }
+    .msg-assistant {
+        background: #1a2420;
+        border: 1px solid #2d3f38;
+    }
+    .msg-assistant h2, .msg-assistant h3, .msg-assistant h4 {
+        color: #e6eeea !important;
+        margin: 0.85rem 0 0.4rem 0;
+        line-height: 1.3;
+    }
+    .msg-assistant h2 { font-size: 1.15rem; }
+    .msg-assistant h3 { font-size: 1.02rem; }
+    .msg-assistant h4 { font-size: 0.95rem; }
+    .msg-assistant p { margin: 0.35rem 0; line-height: 1.5; }
+    .msg-assistant ul { margin: 0.35rem 0 0.55rem 1.1rem; padding: 0; }
+    .msg-assistant li { margin: 0.2rem 0; line-height: 1.45; }
+    .msg-assistant table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 0.45rem 0 0.75rem 0;
+        font-size: 0.86rem;
+    }
+    .msg-assistant th, .msg-assistant td {
+        border: 1px solid #2d3f38;
+        padding: 0.35rem 0.5rem;
+        text-align: left;
+    }
+    .msg-assistant th {
+        background: #243f36;
+        color: #c5ddd4;
+        font-weight: 600;
+    }
+    .msg-assistant code {
+        background: #243f36;
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.84em;
+    }
+    .msg-role {
+        font-size: 0.78rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #8aa399;
+        margin: 0.35rem 0 0.15rem 0;
+        font-weight: 600;
+    }
     .example-arrow {
         text-align: center;
-        color: #6b7c76;
+        color: #8aa399;
         font-size: 0.95rem;
         line-height: 1;
         margin: -0.15rem 0 0.15rem 0;
@@ -111,7 +212,7 @@ CUSTOM_CSS = """
     }
     .example-or {
         text-align: center;
-        color: #6b7c76;
+        color: #8aa399;
         font-size: 0.8rem;
         letter-spacing: 0.08em;
         margin: 0.65rem 0 0.55rem 0;
@@ -119,12 +220,12 @@ CUSTOM_CSS = """
     }
     .tour-popup {
         position: relative;
-        background: linear-gradient(145deg, #1a2e28 0%, #2d4a42 100%);
-        color: #f4f1ea;
+        background: linear-gradient(145deg, #14201c 0%, #1f332c 100%);
+        color: #e6eeea;
         border-radius: 12px;
         padding: 0.95rem 1.1rem 1rem 1.1rem;
         margin: 0.35rem 0 0.85rem 0;
-        box-shadow: 0 10px 28px rgba(26, 46, 40, 0.28);
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
         border: 1px solid #3d6b5e;
     }
     .tour-popup::after {
@@ -136,12 +237,12 @@ CUSTOM_CSS = """
         height: 0;
         border-left: 9px solid transparent;
         border-right: 9px solid transparent;
-        border-top: 9px solid #2d4a42;
+        border-top: 9px solid #1f332c;
     }
     .tour-popup .tour-step {
         display: inline-block;
-        background: #c5ddd4;
-        color: #1a2e28;
+        background: #3d6b5e;
+        color: #e6eeea;
         border-radius: 999px;
         padding: 0.1rem 0.55rem;
         font-size: 0.75rem;
@@ -149,7 +250,7 @@ CUSTOM_CSS = """
         margin-bottom: 0.45rem;
     }
     .tour-popup h4 {
-        color: #f4f1ea !important;
+        color: #e6eeea !important;
         margin: 0 0 0.35rem 0;
         font-size: 1.02rem;
     }
@@ -167,19 +268,52 @@ CUSTOM_CSS = """
     .site-footer {
         margin-top: 2.5rem;
         padding: 1.35rem 1rem 1.1rem 1rem;
-        border-top: 1px solid #e4e0d8;
+        border-top: 1px solid #2d3f38;
         text-align: center;
-        color: #5a6b64;
+        color: #8aa399;
         font-size: 0.88rem;
         line-height: 1.65;
     }
     .site-footer a {
-        color: #1a2e28;
+        color: #6bc4a6;
         text-decoration: underline;
         text-underline-offset: 2px;
     }
     .site-footer a:hover {
-        color: #2d4a42;
+        color: #9ad9c4;
+    }
+    .demo-card {
+        background: #141c19;
+        border: 1px solid #2d3f38;
+        border-radius: 10px;
+        padding: 0.75rem 0.85rem 0.35rem 0.85rem;
+        margin: 0.55rem 0 0.15rem 0;
+    }
+    .demo-card .demo-title {
+        color: #e6eeea;
+        font-weight: 650;
+        font-size: 0.95rem;
+        margin: 0 0 0.25rem 0;
+        line-height: 1.3;
+    }
+    .demo-card .demo-plain {
+        color: #a8bdb4;
+        font-size: 0.8rem;
+        margin: 0 0 0.45rem 0;
+        line-height: 1.35;
+    }
+    .demo-card .demo-meta {
+        color: #7a9a8c;
+        font-size: 0.72rem;
+        margin: 0 0 0.15rem 0;
+        line-height: 1.35;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    .demo-card .demo-agent {
+        color: #6bc4a6;
+        font-size: 0.72rem;
+        margin: 0 0 0.35rem 0;
+        line-height: 1.35;
     }
 </style>
 """
@@ -259,11 +393,22 @@ def _fresh_state() -> dict:
         "busy": False,
         "tour_active": True,
         "tour_step": 0,
+        "toolkit_demos": {},
     }
 
 
 # Only app-owned keys — never delete Streamlit widget keys in the same click handler.
-_APP_KEYS = ("workspace", "events", "messages", "busy", "pending_prompt", "flash", "tour_active", "tour_step")
+_APP_KEYS = (
+    "workspace",
+    "events",
+    "messages",
+    "busy",
+    "pending_prompt",
+    "flash",
+    "tour_active",
+    "tour_step",
+    "toolkit_demos",
+)
 
 
 def init_session() -> None:
@@ -281,7 +426,114 @@ def hard_reset_session() -> None:
     st.session_state.events = fresh["events"]
     st.session_state.messages = fresh["messages"]
     st.session_state.busy = False
+    st.session_state.toolkit_demos = fresh["toolkit_demos"]
     st.session_state.flash = "Workspace reset — conversation and results cleared."
+
+
+def _ensure_demo_dataset(ws: SharedWorkspace) -> dict:
+    """Use the active dataset, or create a small synthetic one for demos."""
+    if ws.dataset:
+        return ws.dataset
+    meta = dataset_tools.create_ecommerce_orders(n_rows=1_500, seed=42, name="tier0_demo_orders")
+    ws.dataset = meta
+    return meta
+
+
+def run_tier0_eda_demo(ws: SharedWorkspace) -> dict:
+    meta = _ensure_demo_dataset(ws)
+    corr = eda_tools.correlation_matrix(
+        meta,
+        columns=["quantity", "unit_price", "total_amount"],
+    )
+    missing = eda_tools.missingness_summary(meta)
+    quantiles = eda_tools.quantile_stats(meta, columns=["total_amount", "unit_price", "quantity"])
+    return {"correlation": corr, "missingness": missing, "quantiles": quantiles}
+
+
+def run_tier0_aggs_demo(ws: SharedWorkspace) -> dict:
+    meta = _ensure_demo_dataset(ws)
+    return {
+        "std": query_tools.execute_aggregation(
+            meta, group_by="product_category", metric_column="total_amount", agg="std"
+        ),
+        "nunique": query_tools.execute_aggregation(
+            meta, group_by="product_category", metric_column="customer_id", agg="nunique"
+        ),
+        "pct": query_tools.execute_aggregation(
+            meta, group_by="product_category", metric_column="total_amount", agg="pct"
+        ),
+    }
+
+
+def run_tier0_charts_demo(ws: SharedWorkspace) -> list[dict]:
+    meta = _ensure_demo_dataset(ws)
+    df = dataset_tools.load_dataset(meta)
+    dual_records = (
+        df.groupby("product_category", as_index=False)
+        .agg(revenue=("total_amount", "sum"), orders=("order_id", "count"))
+        .to_dict(orient="records")
+    )
+    # Replace prior Tier 0 demo charts so re-runs don't stack duplicates
+    ws.visualizations = [
+        v for v in ws.visualizations if not str(v.get("title") or "").startswith("Tier 0 ·")
+    ]
+    charts = [
+        chart_tools.render_chart(
+            chart_type="box",
+            title="Tier 0 · Order amounts by category (box chart)",
+            dataset_meta=meta,
+            x="product_category",
+            y="total_amount",
+        ),
+        chart_tools.render_chart(
+            chart_type="heatmap",
+            title="Tier 0 · How numeric columns relate (heat map)",
+            dataset_meta=meta,
+        ),
+        chart_tools.render_chart(
+            chart_type="dual_axis",
+            title="Tier 0 · Revenue and order count together",
+            data_records=dual_records,
+            x="product_category",
+            y="revenue",
+            y2="orders",
+        ),
+    ]
+    # Surface in Charts tab as well
+    for chart in charts:
+        ws.visualizations.append(chart)
+    return charts
+
+
+def run_tier0_demo(kind: str) -> None:
+    """Execute Tier 0 tool demos and stash results for the Toolkit tab."""
+    ws: SharedWorkspace = st.session_state.workspace
+    demos = dict(st.session_state.get("toolkit_demos") or {})
+    spinner_labels = {
+        "eda": "exploring the data",
+        "aggs": "summarizing by category",
+        "charts": "building charts",
+        "all": "running all demos",
+    }
+    with st.spinner(f"Running demo: {spinner_labels.get(kind, kind)}…"):
+        if kind in {"eda", "all"}:
+            demos["eda"] = run_tier0_eda_demo(ws)
+        if kind in {"aggs", "all"}:
+            demos["aggs"] = run_tier0_aggs_demo(ws)
+        if kind in {"charts", "all"}:
+            demos["charts"] = run_tier0_charts_demo(ws)
+    st.session_state.toolkit_demos = demos
+    st.session_state.workspace = ws
+    labels = {
+        "eda": "data exploration",
+        "aggs": "category summaries",
+        "charts": "new chart types",
+        "all": "all toolkit demos",
+    }
+    st.session_state.flash = (
+        f"Demo ready — {labels.get(kind, kind)}. Open the **Toolkit** tab "
+        "(and **Charts** for the new visuals)."
+    )
 
 
 def apply_reset_if_requested() -> bool:
@@ -395,6 +647,18 @@ def render_dataset_panel(ws: SharedWorkspace) -> None:
     if profile.get("categorical_top"):
         st.markdown("#### Top categories")
         st.json(profile["categorical_top"])
+    eda = ds.get("eda") or {}
+    if eda:
+        st.markdown("#### Exploration (Dataset Agent)")
+        miss = eda.get("missingness") or {}
+        st.caption(
+            f"Blank cells: **{miss.get('total_nulls', 0)}** "
+            f"({(miss.get('overall_null_rate') or 0) * 100:.2f}%)"
+        )
+        pairs = (eda.get("correlation") or {}).get("pairs") or []
+        if pairs:
+            st.markdown("Top column links")
+            st.dataframe(pairs[:8], use_container_width=True)
 
 
 def render_analysis_panel(ws: SharedWorkspace) -> None:
@@ -402,18 +666,41 @@ def render_analysis_panel(ws: SharedWorkspace) -> None:
         st.info("No analysis results yet.")
         return
     for i, item in enumerate(ws.analysis_results, 1):
-        st.markdown(f"#### Analysis {i}")
+        result = item.get("result") or {}
+        is_eda = (item.get("query_plan") or {}).get("mode") == "eda" or result.get("operation") == "eda"
+        st.markdown(f"#### Analysis {i}" + (" — Exploration" if is_eda else ""))
         st.markdown(item.get("explanation") or "")
-        records = item.get("result", {}).get("records") or []
-        if records:
-            st.dataframe(records, use_container_width=True)
+
+        if is_eda:
+            pairs = (result.get("correlation") or {}).get("pairs") or result.get("records") or []
+            st.markdown("**How columns relate**")
+            if pairs:
+                st.dataframe(pairs, use_container_width=True)
+            miss = result.get("missingness") or {}
+            st.markdown("**Missing values**")
+            st.caption(
+                f"Blank cells: **{miss.get('total_nulls', 0)}** "
+                f"({(miss.get('overall_null_rate') or 0) * 100:.2f}% overall)"
+            )
+            if miss.get("columns"):
+                st.dataframe(miss["columns"], use_container_width=True)
+            qstats = (result.get("quantiles") or {}).get("stats") or {}
+            st.markdown("**Typical ranges**")
+            if qstats:
+                rows = [{"column": col, **vals} for col, vals in qstats.items()]
+                st.dataframe(rows, use_container_width=True)
+        else:
+            records = result.get("records") or []
+            if records:
+                st.dataframe(records, use_container_width=True)
+
         with st.expander("Query plan / tool output"):
             st.json(
                 {
                     "query_plan": item.get("query_plan"),
-                    "grounded": item.get("result", {}).get("grounded"),
-                    "sql": item.get("result", {}).get("sql")
-                    or item.get("result", {}).get("sql_equivalent"),
+                    "grounded": result.get("grounded"),
+                    "sql": result.get("sql") or result.get("sql_equivalent"),
+                    "operation": result.get("operation"),
                 }
             )
 
@@ -463,6 +750,108 @@ def render_history_panel(ws: SharedWorkspace) -> None:
         st.info("No agent history yet.")
         return
     st.json(ws.agent_history)
+
+
+def render_toolkit_panel(demos: dict, ws: SharedWorkspace | None = None) -> None:
+    """Show toolkit outputs from agent runs (and optional cached demos)."""
+    eda_block = (demos or {}).get("eda")
+    aggs_block = (demos or {}).get("aggs")
+    charts_block = (demos or {}).get("charts")
+
+    if ws is not None:
+        if not eda_block and (ws.dataset or {}).get("eda"):
+            eda_block = (ws.dataset or {}).get("eda")
+        if not eda_block:
+            for item in ws.analysis_results:
+                result = item.get("result") or {}
+                if result.get("operation") == "eda" or (item.get("query_plan") or {}).get("mode") == "eda":
+                    eda_block = {
+                        "correlation": result.get("correlation"),
+                        "missingness": result.get("missingness"),
+                        "quantiles": result.get("quantiles"),
+                    }
+                    break
+        if not aggs_block:
+            found: dict = {}
+            for item in ws.analysis_results:
+                result = item.get("result") or {}
+                agg = result.get("agg")
+                if agg in {"std", "nunique", "pct"} and agg not in found:
+                    found[agg] = result
+            if found:
+                aggs_block = found
+        if not charts_block:
+            charts_block = [
+                v
+                for v in ws.visualizations
+                if (v.get("chart_type") or "") in {"box", "heatmap", "dual_axis", "boxplot"}
+            ]
+
+    if not eda_block and not aggs_block and not charts_block:
+        st.info(
+            "Nothing here yet. In the sidebar under **Try these new tools**, pick an option — "
+            "those prompts go through the Dataset, Analysis, and Visualization agents."
+        )
+        return
+
+    if eda_block:
+        eda = eda_block
+        st.markdown("#### How columns relate to each other")
+        st.caption(
+            "Closer to 1 or −1 means a stronger link between two numbers "
+            "(quantity, unit price, and order total)."
+        )
+        corr = eda.get("correlation") if isinstance(eda.get("correlation"), dict) else eda
+        pairs = (corr or {}).get("pairs") or []
+        if pairs:
+            st.dataframe(pairs, use_container_width=True)
+        with st.expander("Full relationship table"):
+            st.json((eda.get("correlation") or {}).get("matrix") or eda.get("matrix") or {})
+
+        st.markdown("#### Missing or blank values")
+        miss = eda.get("missingness") or {}
+        st.caption(
+            f"Share of blank cells: **{(miss.get('overall_null_rate') or 0) * 100:.2f}%** · "
+            f"blank cells total: **{miss.get('total_nulls', '—')}**"
+        )
+        if miss.get("columns"):
+            st.dataframe(miss.get("columns") or [], use_container_width=True)
+
+        st.markdown("#### Typical ranges (low → mid → high)")
+        st.caption("Shows where most values sit — from the smallest, through the middle, to the largest.")
+        qstats = (eda.get("quantiles") or {}).get("stats") or {}
+        rows = [{"column": col, **vals} for col, vals in qstats.items()]
+        if rows:
+            st.dataframe(rows, use_container_width=True)
+
+    if aggs_block:
+        aggs = aggs_block
+        st.markdown("#### Summaries by product category")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**How spread out** order totals are")
+            st.dataframe((aggs.get("std") or {}).get("records") or [], use_container_width=True)
+        with c2:
+            st.markdown("**How many different** customers")
+            st.dataframe((aggs.get("nunique") or {}).get("records") or [], use_container_width=True)
+        with c3:
+            st.markdown("**Share of revenue** (%)")
+            st.dataframe((aggs.get("pct") or {}).get("records") or [], use_container_width=True)
+
+    if charts_block:
+        st.markdown("#### New chart styles")
+        st.caption("These also appear under the **Charts** tab.")
+        for i, viz in enumerate(charts_block):
+            st.markdown(f"**{viz.get('title')}** (`{viz.get('chart_type')}`)")
+            fig_json = viz.get("plotly_json")
+            if fig_json:
+                payload = json.dumps(fig_json) if isinstance(fig_json, dict) else fig_json
+                fig = pio.from_json(payload)
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key=f"toolkit_chart_{viz.get('id')}_{i}",
+                )
 
 
 def render_tour_popup(step_index: int) -> None:
@@ -536,11 +925,20 @@ def render_conversation(messages: list[dict]) -> None:
         return
     for msg in messages:
         role = msg.get("role", "assistant")
-        css = "msg-user" if role == "user" else "msg-assistant"
-        label = "You" if role == "user" else "Agents"
-        # Escape-free markdown body; role label only in plain text prefix
-        st.markdown(f"**{label}**")
-        st.markdown(f'<div class="{css}">{_html_escape(msg.get("content") or "")}</div>', unsafe_allow_html=True)
+        content = (msg.get("content") or "").strip()
+        if role == "user":
+            st.markdown('<div class="msg-role">You</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="msg-user">{_html_escape(content)}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown('<div class="msg-role">Agents</div>', unsafe_allow_html=True)
+            # Render markdown inside the bubble (headings, lists, tables)
+            st.markdown(
+                f'<div class="msg-assistant">{_markdown_to_safe_html(content)}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def _html_escape(text: str) -> str:
@@ -550,6 +948,110 @@ def _html_escape(text: str) -> str:
         .replace(">", "&gt;")
         .replace("\n", "<br>")
     )
+
+
+def _markdown_to_safe_html(text: str) -> str:
+    """Lightweight markdown → HTML for chat bubbles (no raw HTML from the model)."""
+    import html
+    import re
+
+    # Escape first so agent text cannot inject tags
+    t = html.escape(text or "")
+
+    # Fenced code blocks
+    def _code_block(m: re.Match[str]) -> str:
+        return f"<pre><code>{m.group(1).strip()}</code></pre>"
+
+    t = re.sub(r"```[\w]*\n([\s\S]*?)```", _code_block, t)
+
+    # Tables: consecutive lines starting with |
+    def _convert_tables(block: str) -> str:
+        lines = block.split("\n")
+        out: list[str] = []
+        i = 0
+        while i < len(lines):
+            if lines[i].strip().startswith("|") and i + 1 < len(lines) and re.match(
+                r"^\s*\|?\s*:?-{3,}", lines[i + 1]
+            ):
+                header = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                i += 2
+                rows: list[list[str]] = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                    i += 1
+                html_rows = "".join(
+                    "<tr>" + "".join(f"<th>{h}</th>" for h in header) + "</tr>"
+                )
+                html_rows += "".join(
+                    "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows
+                )
+                out.append(f"<table>{html_rows}</table>")
+                continue
+            out.append(lines[i])
+            i += 1
+        return "\n".join(out)
+
+    t = _convert_tables(t)
+
+    # Headings (longest first)
+    t = re.sub(r"^#### (.+)$", r"<h4>\1</h4>", t, flags=re.MULTILINE)
+    t = re.sub(r"^### (.+)$", r"<h3>\1</h3>", t, flags=re.MULTILINE)
+    t = re.sub(r"^## (.+)$", r"<h3>\1</h3>", t, flags=re.MULTILINE)
+    t = re.sub(r"^# (.+)$", r"<h2>\1</h2>", t, flags=re.MULTILINE)
+
+    # Bold / italic / inline code
+    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+    t = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", t)
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"^---$", r"<hr>", t, flags=re.MULTILINE)
+
+    # Unordered lists
+    def _lists(block: str) -> str:
+        lines = block.split("\n")
+        out: list[str] = []
+        in_list = False
+        for line in lines:
+            m = re.match(r"^[-*] (.+)$", line)
+            if m:
+                if not in_list:
+                    out.append("<ul>")
+                    in_list = True
+                out.append(f"<li>{m.group(1)}</li>")
+            else:
+                if in_list:
+                    out.append("</ul>")
+                    in_list = False
+                out.append(line)
+        if in_list:
+            out.append("</ul>")
+        return "\n".join(out)
+
+    t = _lists(t)
+
+    # Turn remaining text lines into paragraphs; keep block elements intact
+    block_prefixes = ("<h2", "<h3", "<h4", "<ul", "</ul", "<table", "<pre", "<hr", "<li")
+    rendered: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        body = "<br>".join(buf)
+        rendered.append(f"<p>{body}</p>")
+        buf.clear()
+
+    for line in t.split("\n"):
+        s = line.strip()
+        if not s:
+            flush()
+            continue
+        if s.startswith(block_prefixes):
+            flush()
+            rendered.append(s)
+        else:
+            buf.append(s)
+    flush()
+    return "\n".join(rendered)
 
 
 def run_request(prompt: str) -> None:
@@ -628,6 +1130,23 @@ def main() -> None:
         if st.button(full_label, use_container_width=True, key="example_full_workflow"):
             pending_from_example = full_prompt
 
+        st.divider()
+        st.markdown("### Try these new tools")
+        for demo in TIER0_DEMOS:
+            st.markdown(
+                f"""
+                <div class="demo-card">
+                  <div class="demo-title">{demo["title"]}</div>
+                  <div class="demo-plain">{demo["plain"]}</div>
+                  <div class="demo-meta">{demo["jargon"]}</div>
+                  <div class="demo-agent">→ {demo["agents"]}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Run", use_container_width=True, key=f"tier0_demo_{demo['key']}"):
+                pending_from_example = demo["prompt"]
+
     # Always bind panels to the latest session_state after callbacks (e.g. reset on_click)
     ws: SharedWorkspace = st.session_state.workspace
     render_header(ws)
@@ -673,7 +1192,7 @@ def main() -> None:
         if tour_active:
             render_tour_popup(tour_step)
 
-        tab_labels = [s["tab"] for s in TOUR_STEPS]
+        tab_labels = [s["tab"] for s in TOUR_STEPS] + ["Toolkit"]
         default_tab = TOUR_STEPS[tour_step]["tab"] if tour_active else "Progress"
         # Remount tabs when the tour step changes so the pointed tab becomes active
         tabs = st.tabs(
@@ -724,6 +1243,17 @@ def main() -> None:
                 TOUR_STEPS[5]["body"],
             )
             render_history_panel(ws)
+        with tabs[6]:
+            section_help(
+                "Toolkit",
+                "Dataset · Analysis · Visualization agents",
+                (
+                    "Results from the newer tools wired into agents: explore how columns relate, "
+                    "find blank values and value ranges, summarize by category "
+                    "(spread, unique counts, percent share), and box / heat / dual charts."
+                ),
+            )
+            render_toolkit_panel(dict(st.session_state.get("toolkit_demos") or {}), ws)
 
     render_footer()
 

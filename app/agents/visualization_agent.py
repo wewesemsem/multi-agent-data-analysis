@@ -8,6 +8,7 @@ from app.llm import LLMClient
 from app.messages import AgentMessage, AgentResult
 from app.state import SharedWorkspace
 from app.tools import chart_tools
+from app.tools.query_tools import coerce_column_ref
 
 
 _AMOUNT_HINTS = ("total_amount", "revenue", "amount", "unit_price", "value", "price", "sales")
@@ -127,13 +128,16 @@ class VisualizationAgent:
 
         system = (
             "Return JSON {\"specs\":[...]} where each spec has: "
-            "chart_type (bar|line|scatter|histogram|pie), title, "
+            "chart_type (bar|line|scatter|histogram|pie|box|heatmap|dual_axis), title, "
             "aggregation optional {group_by, metric_column, agg}, "
-            "x, y, color optional. "
+            "x, y, y2, color optional. "
             f"Use ONLY these exact column names: {cols}. "
             "Never invent column names like 'revenue' — use total_amount when that exists. "
             "metric_column and group_by must be non-null when aggregation is used. "
             "If the user asks for a pie chart, set chart_type to pie. "
+            "If the user asks for a box plot, set chart_type to box. "
+            "If the user asks for a heatmap / correlation heat map, set chart_type to heatmap. "
+            "If the user asks for dual-axis / two metrics together, set chart_type to dual_axis. "
             "If the user asks for both category revenue and amount distribution, return TWO specs."
         )
         out = self.llm.chat_json(system, f"Request: {request}\nSchema: {schema}")
@@ -156,8 +160,14 @@ class VisualizationAgent:
         if not workspace.analysis_results:
             return []
         req = request.lower()
+        # Don't reuse analysis bars/pies when the user asked for box / heatmap / dual-axis
+        if any(
+            k in req
+            for k in ("box plot", "boxplot", "box chart", "heatmap", "heat map", "dual axis", "dual-axis", "dual chart")
+        ):
+            return []
         # Only reuse analysis output for visualization-oriented requests
-        if not any(k in req for k in ("visual", "chart", "plot", "graph", "show", "pie")):
+        if not any(k in req for k in ("visual", "chart", "plot", "graph", "show", "pie", "box", "heatmap", "heat map", "dual")):
             return []
 
         item = workspace.analysis_results[-1]
@@ -218,6 +228,96 @@ class VisualizationAgent:
         amount = self._resolve_column(cols, _AMOUNT_HINTS)
         date = self._resolve_column(cols, _DATE_HINTS)
         chart_type = chart_tools.choose_chart_type(request)
+
+        # Multi-intent: box + heatmap + dual in one request
+        multi_specs: list[dict[str, Any]] = []
+        if any(k in req for k in ("box plot", "boxplot", "box chart")) and amount:
+            multi_specs.append(
+                {
+                    "chart_type": "box",
+                    "title": f"{amount} by {cat}" if cat else f"Box plot of {amount}",
+                    "x": cat,
+                    "y": amount,
+                    "use_raw_dataset": True,
+                }
+            )
+        if any(k in req for k in ("heatmap", "heat map")):
+            multi_specs.append(
+                {
+                    "chart_type": "heatmap",
+                    "title": "How numeric columns relate",
+                    "use_raw_dataset": True,
+                }
+            )
+        if any(k in req for k in ("dual axis", "dual-axis", "dual chart", "two axis")) and cat and amount:
+            from app.tools.dataset_tools import load_dataset
+
+            df = load_dataset(workspace.dataset) if workspace.dataset else None
+            if df is not None and cat in df.columns and amount in df.columns:
+                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
+                dual = (
+                    df.groupby(cat, as_index=False)
+                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
+                    .to_dict(orient="records")
+                )
+                multi_specs.append(
+                    {
+                        "chart_type": "dual_axis",
+                        "title": f"Revenue and order count by {cat}",
+                        "data_records": dual,
+                        "x": cat,
+                        "y": "revenue",
+                        "y2": "orders",
+                    }
+                )
+        if len(multi_specs) >= 2:
+            return multi_specs
+        if len(multi_specs) == 1:
+            return multi_specs
+
+        # Explicit single new chart types
+        if chart_type == "box" and amount:
+            specs.append(
+                {
+                    "chart_type": "box",
+                    "title": f"{amount} by {cat}" if cat else f"Box plot of {amount}",
+                    "x": cat,
+                    "y": amount,
+                    "use_raw_dataset": True,
+                }
+            )
+            return specs
+        if chart_type == "heatmap":
+            specs.append(
+                {
+                    "chart_type": "heatmap",
+                    "title": "How numeric columns relate",
+                    "use_raw_dataset": True,
+                }
+            )
+            return specs
+        if chart_type == "dual_axis" and cat and amount:
+            from app.tools.dataset_tools import load_dataset
+
+            df = load_dataset(workspace.dataset) if workspace.dataset else None
+            if df is not None and cat in df.columns and amount in df.columns:
+                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
+                dual = (
+                    df.groupby(cat, as_index=False)
+                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
+                    .to_dict(orient="records")
+                )
+                specs.append(
+                    {
+                        "chart_type": "dual_axis",
+                        "title": f"Revenue and order count by {cat}",
+                        "data_records": dual,
+                        "x": cat,
+                        "y": "revenue",
+                        "y2": "orders",
+                    }
+                )
+                return specs
 
         want_revenue_by_cat = (
             ("categor" in req and any(k in req for k in ("revenue", "visual", "chart", "show", "pie")))
@@ -297,15 +397,76 @@ class VisualizationAgent:
             records = out["data_records"]
             if isinstance(records, list) and records and isinstance(records[0], dict):
                 keys = list(records[0].keys())
-                out["x"] = out.get("x") if out.get("x") in keys else keys[0]
+                x_ref = coerce_column_ref(out.get("x"))
+                y_ref = coerce_column_ref(out.get("y"))
+                y2_ref = coerce_column_ref(out.get("y2"))
+                out["x"] = x_ref if x_ref in keys else keys[0]
                 if len(keys) > 1:
-                    out["y"] = out.get("y") if out.get("y") in keys else (
+                    out["y"] = y_ref if y_ref in keys else (
                         "value" if "value" in keys else keys[1]
                     )
+                if y2_ref and y2_ref not in keys:
+                    numeric = [k for k in keys if k not in {out.get("x"), out.get("y")}]
+                    out["y2"] = numeric[0] if numeric else None
+                elif y2_ref:
+                    out["y2"] = y2_ref
                 out.setdefault("chart_type", "bar")
                 out.setdefault("title", "Chart")
                 return out
             return None
+
+        chart_type = (out.get("chart_type") or "bar").lower().replace("-", "_")
+        if chart_type in {"dualaxis", "dual"}:
+            chart_type = "dual_axis"
+        out["chart_type"] = chart_type
+
+        if chart_type == "heatmap":
+            out["use_raw_dataset"] = True
+            out.setdefault("title", "How numeric columns relate")
+            return out
+
+        if chart_type in {"box", "boxplot"}:
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
+                cols, _AMOUNT_HINTS
+            )
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
+                cols, _CATEGORY_HINTS
+            )
+            if not amount:
+                return None
+            out["chart_type"] = "box"
+            out["x"] = cat
+            out["y"] = amount
+            out["use_raw_dataset"] = True
+            out.setdefault("title", f"{amount} by {cat}" if cat else f"Box plot of {amount}")
+            return out
+
+        if chart_type == "dual_axis":
+            from app.tools.dataset_tools import load_dataset
+
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
+                cols, _CATEGORY_HINTS
+            )
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
+                cols, _AMOUNT_HINTS
+            )
+            if not cat or not amount or not workspace.dataset:
+                return None
+            df = load_dataset(workspace.dataset)
+            id_col = self._resolve_column(cols, ("order_id", "id")) or amount
+            dual = (
+                df.groupby(cat, as_index=False)
+                .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
+                .to_dict(orient="records")
+            )
+            return {
+                "chart_type": "dual_axis",
+                "title": out.get("title") or f"Revenue and order count by {cat}",
+                "data_records": dual,
+                "x": cat,
+                "y": "revenue",
+                "y2": "orders",
+            }
 
         agg = out.get("aggregation")
         if isinstance(agg, dict) or out.get("group_by") or out.get("metric_column"):
@@ -334,7 +495,6 @@ class VisualizationAgent:
             return out
 
         # Raw / histogram path
-        chart_type = (out.get("chart_type") or "bar").lower()
         x = self._map_column(out.get("x"), cols, _AMOUNT_HINTS if chart_type == "histogram" else _CATEGORY_HINTS)
         y = self._map_column(out.get("y"), cols, _AMOUNT_HINTS)
         if chart_type == "histogram":
@@ -383,11 +543,12 @@ class VisualizationAgent:
     @classmethod
     def _map_column(
         cls,
-        name: str | None,
+        name: Any,
         cols: list[str],
         hints: tuple[str, ...],
     ) -> str | None:
-        if not name or name in {"None", "null", "undefined"}:
+        name = coerce_column_ref(name)
+        if not name:
             return None
         lower_map = {c.lower(): c for c in cols}
         if name in cols:
@@ -406,6 +567,8 @@ class VisualizationAgent:
                 data_records=spec["data_records"],
                 x=spec.get("x"),
                 y=spec.get("y"),
+                y2=spec.get("y2"),
+                z=spec.get("z"),
                 color=spec.get("color"),
             )
         if spec.get("use_raw_dataset"):
@@ -415,6 +578,8 @@ class VisualizationAgent:
                 dataset_meta=workspace.dataset,
                 x=spec.get("x"),
                 y=spec.get("y"),
+                y2=spec.get("y2"),
+                z=spec.get("z"),
                 color=spec.get("color"),
             )
         aggregation = spec.get("aggregation")
@@ -426,6 +591,8 @@ class VisualizationAgent:
             dataset_meta=workspace.dataset,
             x=spec.get("x"),
             y=spec.get("y"),
+            y2=spec.get("y2"),
+            z=spec.get("z"),
             color=spec.get("color"),
             aggregation=aggregation,
         )

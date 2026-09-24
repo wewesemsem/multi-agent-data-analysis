@@ -8,7 +8,7 @@ from typing import Any
 from app.llm import LLMClient
 from app.messages import AgentMessage, AgentResult
 from app.state import SharedWorkspace
-from app.tools import dataset_tools
+from app.tools import dataset_tools, eda_tools
 
 
 class DatasetAgent:
@@ -26,8 +26,8 @@ class DatasetAgent:
                 return self._load_csv(message, workspace)
             if action == "inspect_schema":
                 return self._inspect(workspace, message.task_id)
-            if action == "profile_dataset":
-                return self._profile(workspace, message.task_id)
+            if action in {"profile_dataset", "explore_dataset", "explore"}:
+                return self._explore(workspace, message.task_id, action=action)
             return AgentResult(
                 task_id=message.task_id,
                 source_agent=self.name,  # type: ignore[arg-type]
@@ -162,24 +162,59 @@ class DatasetAgent:
             grounded=True,
         )
 
-    def _profile(self, workspace: SharedWorkspace, task_id: str) -> AgentResult:
+    def _explore(self, workspace: SharedWorkspace, task_id: str, *, action: str) -> AgentResult:
         if not workspace.dataset:
             return AgentResult(
                 task_id=task_id,
                 source_agent=self.name,  # type: ignore[arg-type]
-                action="profile_dataset",
+                action=action,
                 success=False,
                 error="No dataset in shared workspace.",
                 grounded=False,
             )
-        df = dataset_tools.load_dataset(workspace.dataset)
+        meta = workspace.dataset
+        df = dataset_tools.load_dataset(meta)
         profile = dataset_tools.profile_dataframe(df)
+        missing = eda_tools.missingness_summary(meta)
+        quantiles = eda_tools.quantile_stats(meta)
+        try:
+            correlation = eda_tools.correlation_matrix(meta)
+        except ValueError:
+            correlation = {
+                "operation": "correlation_matrix",
+                "columns": [],
+                "matrix": {},
+                "pairs": [],
+                "grounded": True,
+                "source_dataset_id": meta.get("id"),
+                "note": "Fewer than two numeric columns available.",
+            }
+
+        eda = {
+            "profile": profile,
+            "missingness": missing,
+            "quantiles": quantiles,
+            "correlation": correlation,
+            "grounded": True,
+        }
         workspace.dataset["profile"] = profile
+        workspace.dataset["eda"] = eda
+        workspace.record(
+            agent=self.name,
+            action=action,
+            received={"dataset_id": meta.get("id")},
+            produced={
+                "null_total": missing.get("total_nulls"),
+                "corr_pairs": len(correlation.get("pairs") or []),
+                "quantile_columns": len((quantiles.get("columns") or [])),
+            },
+            success=True,
+        )
         return AgentResult(
             task_id=task_id,
             source_agent=self.name,  # type: ignore[arg-type]
-            action="profile_dataset",
+            action=action,
             success=True,
-            data={"profile": profile},
+            data={"eda": eda, "profile": profile},
             grounded=True,
         )

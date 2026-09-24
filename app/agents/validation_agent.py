@@ -135,7 +135,17 @@ class ValidationAgent:
                     issues.append(f"Visualization[{i}] HTML artifact missing.")
                 if not viz.get("n_points"):
                     issues.append(f"Visualization[{i}] has zero data points.")
-                if viz.get("chart_type") not in {"bar", "line", "scatter", "histogram", "pie"}:
+                if viz.get("chart_type") not in {
+                    "bar",
+                    "line",
+                    "scatter",
+                    "histogram",
+                    "pie",
+                    "box",
+                    "boxplot",
+                    "heatmap",
+                    "dual_axis",
+                }:
                     issues.append(f"Visualization[{i}] has unsupported chart_type.")
         return {"check": "visualizations", "ok": not issues, "issues": issues}
 
