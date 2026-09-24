@@ -54,6 +54,20 @@ class Orchestrator:
 
         plan = self._create_plan(task_id, user_request, workspace)
         workspace.plan = [s.model_dump() for s in plan.steps]
+        expected_outputs = self._expected_outputs(plan)
+        # Replace outputs this run will regenerate so repeated clicks don't stack
+        # duplicates (e.g. 3 charts × N "Run all" clicks). Keep results the plan
+        # does not touch so stepped sidebar examples can build on each other.
+        if "visualizations" in expected_outputs:
+            workspace.visualizations = []
+        if "anomalies" in expected_outputs:
+            workspace.anomalies = []
+        if "analysis" in expected_outputs:
+            workspace.analysis_results = []
+        workspace.validation_reports = []
+        workspace.errors = []
+        workspace.final_response = None
+
         workspace.record(
             agent=self.name,
             action="create_plan",
@@ -66,7 +80,6 @@ class Orchestrator:
         workspace.task_status = "executing"
         max_retries = 1
         pending = list(plan.steps)
-        expected_outputs = self._expected_outputs(plan)
 
         while pending:
             step = pending.pop(0)
@@ -272,6 +285,18 @@ class Orchestrator:
         if not steps:
             heuristic.summary = "Heuristic orchestrator plan (LLM returned no usable steps)"
             return heuristic
+
+        # One visualization step is enough — each call already builds all requested charts.
+        # Multiple viz steps caused 3× duplication (e.g. 3 steps × box/heatmap/dual = 9).
+        deduped: list[PlanStep] = []
+        saw_viz = False
+        for step in steps:
+            if step.agent == "visualization_agent":
+                if saw_viz:
+                    continue
+                saw_viz = True
+            deduped.append(step)
+        steps = deduped
 
         llm_plan = ExecutionPlan(
             task_id=task_id,

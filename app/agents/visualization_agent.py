@@ -37,6 +37,10 @@ class VisualizationAgent:
             if not workspace.dataset and not message.parameters.get("data_records"):
                 raise ValueError("No dataset or data_records available for visualization.")
 
+            # Replace charts for this run (avoids stacking when the planner emits
+            # multiple visualization steps or the user re-runs a demo).
+            workspace.visualizations = []
+
             specs = message.parameters.get("specs")
             if message.parameters.get("force_heuristic"):
                 specs = self._heuristic_specs(
