@@ -220,11 +220,9 @@ class Orchestrator:
         has_dataset = workspace.dataset is not None
         heuristic = self._heuristic_plan(task_id, user_request, has_dataset)
 
-        # Structured toolkit intents must not be dropped by a creative LLM plan
-        # (e.g. explore → only create_dataset). Prefer the deterministic plan.
-        if self._prefer_heuristic_plan(user_request):
-            return heuristic
-
+        # When the LLM is available, always ask it to plan — then augment so
+        # structured toolkit intents (explore / multi-agg / new charts) cannot be dropped.
+        # Heuristic-only planning is reserved for true offline / LLM failure.
         system = (
             "You are a root orchestrator for a multi-agent data intelligence MVP. "
             "Return JSON with keys summary and steps. Each step: "
@@ -237,6 +235,9 @@ class Orchestrator:
             "For explore / profile / missing values / quantiles / how columns relate: "
             "MUST include analysis_agent action=explore AND dataset_agent action=explore_dataset "
             "(create the dataset first if none exists). "
+            "For category summaries asking for spread + unique counts + percent share: "
+            "use analysis_agent action=answer_question. "
+            "For box plot / heatmap / dual-axis requests: use visualization_agent create_visualization. "
             "For detect_anomalies, parameters.method MUST be one of: iqr, zscore, isolation_forest, auto "
             "(use auto when unsure; never invent method names like 'statistical'). "
             "Chart types may include bar, line, scatter, histogram, pie, box, heatmap, dual_axis."
@@ -244,6 +245,13 @@ class Orchestrator:
         user = f"User request: {user_request}\nDataset already loaded: {has_dataset}"
         out = self.llm.chat_json(system, user)
         if out.get("_offline") or out.get("_fallback") or not isinstance(out.get("steps"), list) or not out["steps"]:
+            if out.get("_offline"):
+                reason = "no API key"
+            elif out.get("_fallback"):
+                reason = f"LLM call failed: {out.get('_llm_error', 'unknown error')}"
+            else:
+                reason = "LLM returned an invalid plan"
+            heuristic.summary = f"Heuristic orchestrator plan ({reason})"
             return heuristic
 
         steps = []
@@ -262,6 +270,7 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 continue
         if not steps:
+            heuristic.summary = "Heuristic orchestrator plan (LLM returned no usable steps)"
             return heuristic
 
         llm_plan = ExecutionPlan(
@@ -271,33 +280,6 @@ class Orchestrator:
             summary=out.get("summary") or "LLM-generated execution plan",
         )
         return self._augment_plan(llm_plan, heuristic)
-
-    @staticmethod
-    def _prefer_heuristic_plan(user_request: str) -> bool:
-        q = user_request.lower()
-        return any(
-            k in q
-            for k in (
-                "explore the data",
-                "how columns relate",
-                "columns relate",
-                "missing value",
-                "typical ranges",
-                "blank value",
-                "quantile",
-                "correlat",
-                "percent share",
-                "unique customers",
-                "spread of",
-                "box plot",
-                "boxplot",
-                "heatmap",
-                "heat map",
-                "dual-axis",
-                "dual axis",
-                "dual chart",
-            )
-        )
 
     def _augment_plan(self, llm_plan: ExecutionPlan, heuristic: ExecutionPlan) -> ExecutionPlan:
         """Ensure capability steps from the heuristic plan are not dropped by the LLM."""
@@ -352,7 +334,8 @@ class Orchestrator:
             task_id=llm_plan.task_id,
             user_request=llm_plan.user_request,
             steps=merged,
-            summary=(llm_plan.summary or "") + " (capability steps ensured)",
+            summary=(llm_plan.summary or "LLM-generated execution plan").rstrip()
+            + " (capability steps ensured)",
         )
 
     def _heuristic_plan(self, task_id: str, user_request: str, has_dataset: bool) -> ExecutionPlan:

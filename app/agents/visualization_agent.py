@@ -122,9 +122,24 @@ class VisualizationAgent:
         cols = list(schema.keys())
 
         # Prefer charting grounded analysis results when they already answer the request.
-        analysis_specs = self._specs_from_analysis(request, workspace)
-        if analysis_specs:
-            return analysis_specs + self._extra_distribution_specs(request, schema)
+        # Skip this reuse for explicit multi-chart / new-type intents so LLM specs cannot
+        # accidentally chart aggregated one-metric frames as heatmaps.
+        if not any(
+            k in request.lower()
+            for k in (
+                "box plot",
+                "boxplot",
+                "heatmap",
+                "heat map",
+                "dual axis",
+                "dual-axis",
+                "dual chart",
+                "how numeric columns relate",
+            )
+        ):
+            analysis_specs = self._specs_from_analysis(request, workspace)
+            if analysis_specs:
+                return analysis_specs + self._extra_distribution_specs(request, schema)
 
         system = (
             "Return JSON {\"specs\":[...]} where each spec has: "
@@ -141,20 +156,59 @@ class VisualizationAgent:
             "If the user asks for both category revenue and amount distribution, return TWO specs."
         )
         out = self.llm.chat_json(system, f"Request: {request}\nSchema: {schema}")
+        heuristic = self._heuristic_specs(request, schema, workspace)
         if isinstance(out.get("specs"), list) and out["specs"]:
-            specs = out["specs"]
+            specs = [s for s in out["specs"] if isinstance(s, dict)]
             # Honor explicit pie requests even if the model returned bar
             if self._wants_pie(request):
                 for s in specs:
-                    if isinstance(s, dict) and (s.get("chart_type") or "").lower() in {"bar", "", "none"}:
+                    if (s.get("chart_type") or "").lower() in {"bar", "", "none"}:
                         s["chart_type"] = "pie"
             # Ensure distribution chart is present when requested even if LLM omitted it
             if self._wants_distribution(request) and not any(
-                (s.get("chart_type") or "").lower() == "histogram" for s in specs if isinstance(s, dict)
+                (s.get("chart_type") or "").lower() == "histogram" for s in specs
             ):
                 specs = list(specs) + self._extra_distribution_specs(request, schema)
+            # Fill missing explicit toolkit chart types from heuristics
+            specs = self._merge_missing_chart_types(request, specs, heuristic)
             return specs
-        return self._heuristic_specs(request, schema, workspace)
+        return heuristic
+
+    @staticmethod
+    def _normalize_chart_type_name(chart_type: str | None) -> str:
+        ct = (chart_type or "bar").lower().replace("-", "_").replace(" ", "_")
+        if ct in {"dualaxis", "dual", "dual_axis_chart"}:
+            return "dual_axis"
+        if ct in {"heat_map", "corr_heatmap", "correlation_heatmap"}:
+            return "heatmap"
+        if ct in {"box_plot", "boxplot"}:
+            return "box"
+        return ct
+
+    def _merge_missing_chart_types(
+        self,
+        request: str,
+        specs: list[dict[str, Any]],
+        heuristic: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        req = request.lower()
+        wanted: set[str] = set()
+        if any(k in req for k in ("box plot", "boxplot", "box chart")):
+            wanted.add("box")
+        if any(k in req for k in ("heatmap", "heat map")):
+            wanted.add("heatmap")
+        if any(k in req for k in ("dual axis", "dual-axis", "dual chart", "two axis")):
+            wanted.add("dual_axis")
+        if not wanted:
+            return specs
+        have = {self._normalize_chart_type_name(s.get("chart_type")) for s in specs}
+        merged = list(specs)
+        for hs in heuristic:
+            ct = self._normalize_chart_type_name(hs.get("chart_type"))
+            if ct in wanted and ct not in have:
+                merged.append(hs)
+                have.add(ct)
+        return merged
 
     def _specs_from_analysis(self, request: str, workspace: SharedWorkspace) -> list[dict[str, Any]]:
         if not workspace.analysis_results:
@@ -415,13 +469,19 @@ class VisualizationAgent:
                 return out
             return None
 
-        chart_type = (out.get("chart_type") or "bar").lower().replace("-", "_")
-        if chart_type in {"dualaxis", "dual"}:
+        chart_type = (out.get("chart_type") or "bar").lower().replace("-", "_").replace(" ", "_")
+        if chart_type in {"dualaxis", "dual", "dual_axis_chart"}:
             chart_type = "dual_axis"
+        if chart_type in {"heat_map", "corr_heatmap", "correlation_heatmap"}:
+            chart_type = "heatmap"
+        if chart_type in {"box_plot", "boxplot"}:
+            chart_type = "box"
         out["chart_type"] = chart_type
 
         if chart_type == "heatmap":
             out["use_raw_dataset"] = True
+            out.pop("aggregation", None)
+            out.pop("data_records", None)
             out.setdefault("title", "How numeric columns relate")
             return out
 
@@ -571,7 +631,12 @@ class VisualizationAgent:
                 z=spec.get("z"),
                 color=spec.get("color"),
             )
-        if spec.get("use_raw_dataset"):
+        if spec.get("use_raw_dataset") or (spec.get("chart_type") or "").lower() in {
+            "heatmap",
+            "heat_map",
+            "box",
+            "boxplot",
+        }:
             return chart_tools.render_chart(
                 chart_type=spec.get("chart_type") or "histogram",
                 title=spec.get("title") or "Chart",

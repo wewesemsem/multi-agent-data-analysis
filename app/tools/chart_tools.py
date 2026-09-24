@@ -35,11 +35,19 @@ def render_chart(
     chart_type = (chart_type or "bar").lower().replace("-", "_")
     if chart_type in {"dualaxis", "dual"}:
         chart_type = "dual_axis"
+    if chart_type in {"heat_map", "corr_heatmap", "correlation_heatmap"}:
+        chart_type = "heatmap"
     x = coerce_column_ref(x)
     y = coerce_column_ref(y)
     y2 = coerce_column_ref(y2)
     z = coerce_column_ref(z)
     color = coerce_column_ref(color)
+
+    # Heatmaps must use the full numeric frame (or correlation matrix), never a
+    # one-metric aggregation result the LLM may have attached.
+    if chart_type == "heatmap" and dataset_meta is not None:
+        data_records = None
+        aggregation = None
 
     if data_records is not None:
         df = pd.DataFrame(data_records)

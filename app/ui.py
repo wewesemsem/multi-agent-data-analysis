@@ -1087,7 +1087,7 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         llm = LLMClient()
-        st.caption("LLM: " + ("connected" if llm.available else "offline heuristics"))
+        st.caption("LLM: " + llm.status_label)
         st.link_button("Reset workspace", url="?reset=1", use_container_width=True, type="primary")
 
         st.divider()
