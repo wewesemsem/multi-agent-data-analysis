@@ -45,9 +45,22 @@ def render_chart(
 
     # Heatmaps must use the full numeric frame (or correlation matrix), never a
     # one-metric aggregation result the LLM may have attached.
-    if chart_type == "heatmap" and dataset_meta is not None:
-        data_records = None
-        aggregation = None
+    if chart_type == "heatmap":
+        if dataset_meta is not None:
+            data_records = None
+            aggregation = None
+        elif data_records is not None:
+            # Last resort: only accept a correlation-style frame; otherwise fail clearly.
+            probe = pd.DataFrame(data_records)
+            numeric = probe.select_dtypes(include="number")
+            has_corr_frame = (
+                {"column_a", "column_b", "correlation"}.issubset(probe.columns)
+                or (z and x in probe.columns and y in probe.columns and z in probe.columns)
+            )
+            if not has_corr_frame and numeric.shape[1] < 2:
+                raise ValueError(
+                    "heatmap requires dataset_meta (or a correlation frame with ≥2 numeric columns)."
+                )
 
     if data_records is not None:
         df = pd.DataFrame(data_records)
@@ -61,9 +74,8 @@ def render_chart(
             for b, val in row.items():
                 rows.append({"column_a": a, "column_b": b, "correlation": val})
         df = pd.DataFrame(rows)
-        x = x or "column_a"
-        y = y or "column_b"
-        z = z or "correlation"
+        # Always use correlation axes — ignore leftover LLM x/y (e.g. category/value).
+        x, y, z = "column_a", "column_b", "correlation"
     elif dataset_meta is not None and aggregation:
         df = _aggregate(dataset_meta, aggregation)
         x = x or coerce_column_ref(aggregation.get("group_by"))

@@ -85,3 +85,91 @@ def test_new_chart_types_via_visualization_agent():
     assert "heatmap" in types
     assert "dual_axis" in types
     assert all(c.get("grounded") for c in result.data.get("charts", []))
+
+
+def test_heatmap_ignores_bad_data_records_and_dedupes_llm_specs():
+    """Regression: LLM heatmap+data_records used to abort the whole viz step;
+    duplicate specs used to stack into 9 charts (3×3)."""
+    from app.agents.visualization_agent import VisualizationAgent
+    from app.messages import AgentMessage
+
+    ws = SharedWorkspace()
+    ws.dataset = dataset_tools.create_ecommerce_orders(n_rows=300, seed=24)
+    agent = VisualizationAgent()
+
+    # Simulate a bad LLM plan: heatmap with one-metric records, plus duplicates
+    bad_specs = [
+        {
+            "chart_type": "box",
+            "title": "Box",
+            "x": "product_category",
+            "y": "total_amount",
+            "use_raw_dataset": True,
+        },
+        {
+            "chart_type": "heatmap",
+            "title": "Bad heatmap",
+            "data_records": [{"product_category": "A", "value": 10.0}],
+            "x": "product_category",
+            "y": "value",
+        },
+        {
+            "chart_type": "dual_axis",
+            "title": "Dual",
+            "x": "product_category",
+            "y": "total_amount",
+        },
+        # duplicates that previously became a 3×3 grid
+        {"chart_type": "box", "x": "product_category", "y": "total_amount", "use_raw_dataset": True},
+        {"chart_type": "heatmap", "data_records": [{"a": 1}]},
+        {"chart_type": "dual_axis", "x": "product_category", "y": "total_amount"},
+        {"chart_type": "box", "x": "product_category", "y": "total_amount", "use_raw_dataset": True},
+        {"chart_type": "heatmap"},
+        {"chart_type": "dual_axis", "x": "product_category", "y": "total_amount"},
+    ]
+    request = (
+        "Create a box plot of order amounts by category, a heatmap of how numeric "
+        "columns relate, and a dual-axis chart of revenue and order count by category."
+    )
+    # Toolkit multi-chart path forces heuristics (ignores specs) — still assert 3 charts
+    result = agent.handle(
+        AgentMessage(
+            task_id="t2",
+            source_agent="orchestrator",
+            target_agent="visualization_agent",
+            action="create_visualization",
+            parameters={"user_request": request, "specs": bad_specs},
+        ),
+        ws,
+    )
+    assert result.success, result.error
+    charts = result.data.get("charts", [])
+    assert len(charts) == 3, [c.get("chart_type") for c in charts]
+    types = {c.get("chart_type") for c in charts}
+    assert types == {"box", "heatmap", "dual_axis"}
+
+    # Non-toolkit request with explicit bad heatmap specs still recovers via normalize
+    ws2 = SharedWorkspace()
+    ws2.dataset = dataset_tools.create_ecommerce_orders(n_rows=200, seed=25)
+    result2 = agent.handle(
+        AgentMessage(
+            task_id="t3",
+            source_agent="orchestrator",
+            target_agent="visualization_agent",
+            action="create_visualization",
+            parameters={
+                "user_request": "show a correlation heatmap",
+                "specs": [
+                    {
+                        "chart_type": "heatmap",
+                        "data_records": [{"product_category": "A", "value": 1.0}],
+                        "x": "product_category",
+                        "y": "value",
+                    }
+                ],
+            },
+        ),
+        ws2,
+    )
+    assert result2.success, result2.error
+    assert result2.data["charts"][0]["chart_type"] == "heatmap"

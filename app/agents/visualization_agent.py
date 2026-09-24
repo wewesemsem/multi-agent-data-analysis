@@ -41,39 +41,43 @@ class VisualizationAgent:
             # multiple visualization steps or the user re-runs a demo).
             workspace.visualizations = []
 
+            request = (
+                message.parameters.get("user_request")
+                or message.parameters.get("description")
+                or ""
+            )
+            schema = (workspace.dataset or {}).get("schema", {})
+
             specs = message.parameters.get("specs")
-            if message.parameters.get("force_heuristic"):
-                specs = self._heuristic_specs(
-                    message.parameters.get("user_request")
-                    or message.parameters.get("description")
-                    or "",
-                    (workspace.dataset or {}).get("schema", {}),
-                    workspace,
-                )
+            # Explicit box+heatmap+dual toolkit requests are deterministic — skip flaky
+            # LLM specs that often attach one-metric data_records to heatmaps.
+            if message.parameters.get("force_heuristic") or self._is_toolkit_multi_chart(request):
+                specs = self._heuristic_specs(request, schema, workspace)
             elif not specs:
                 specs = self._plan_specs(message.parameters, workspace)
 
-            schema = (workspace.dataset or {}).get("schema", {})
             specs = [self._normalize_spec(s, schema, workspace) for s in specs]
             specs = [s for s in specs if s]
+            specs = self._dedupe_specs(specs)
             if not specs:
-                specs = self._heuristic_specs(
-                    message.parameters.get("user_request")
-                    or message.parameters.get("description")
-                    or "",
-                    schema,
-                    workspace,
-                )
+                specs = self._heuristic_specs(request, schema, workspace)
                 specs = [self._normalize_spec(s, schema, workspace) for s in specs]
                 specs = [s for s in specs if s]
+                specs = self._dedupe_specs(specs)
             if not specs:
                 raise ValueError(
                     "Could not build a valid visualization spec from the request and dataset schema."
                 )
 
             created = []
+            errors: list[str] = []
             for spec in specs:
-                chart = self._render_one(spec, workspace)
+                try:
+                    chart = self._render_one(spec, workspace)
+                except Exception as chart_exc:  # noqa: BLE001
+                    # One bad LLM heatmap must not abort box / dual_axis siblings.
+                    errors.append(f"{spec.get('chart_type')}: {chart_exc}")
+                    continue
                 workspace.visualizations.append(chart)
                 created.append(
                     {
@@ -88,10 +92,46 @@ class VisualizationAgent:
                     }
                 )
 
+            # Fill any toolkit chart types that failed or were omitted
+            if self._is_toolkit_multi_chart(request) and workspace.dataset:
+                have = {c.get("chart_type") for c in created}
+                for hs in self._heuristic_specs(request, schema, workspace):
+                    ct = self._normalize_chart_type_name(hs.get("chart_type"))
+                    if ct in have:
+                        continue
+                    try:
+                        ns = self._normalize_spec(hs, schema, workspace)
+                        if not ns:
+                            continue
+                        chart = self._render_one(ns, workspace)
+                        workspace.visualizations.append(chart)
+                        created.append(
+                            {
+                                "id": chart["id"],
+                                "title": chart["title"],
+                                "chart_type": chart["chart_type"],
+                                "html_path": chart["html_path"],
+                                "n_points": chart["n_points"],
+                                "grounded": True,
+                                "plotly_json": chart.get("plotly_json"),
+                                "data_preview": chart.get("data_preview"),
+                            }
+                        )
+                        have.add(chart["chart_type"])
+                    except Exception as fill_exc:  # noqa: BLE001
+                        errors.append(f"fill {ct}: {fill_exc}")
+
+            if not created:
+                raise ValueError(
+                    "; ".join(errors)
+                    if errors
+                    else "Could not render any visualizations from the request."
+                )
+
             workspace.record(
                 agent=self.name,
                 action="create_visualization",
-                received={"n_specs": len(specs)},
+                received={"n_specs": len(specs), "render_errors": errors or None},
                 produced={"chart_ids": [c["id"] for c in created]},
                 success=True,
             )
@@ -100,7 +140,7 @@ class VisualizationAgent:
                 source_agent=self.name,  # type: ignore[arg-type]
                 action="create_visualization",
                 success=True,
-                data={"charts": created},
+                data={"charts": created, "render_errors": errors or None},
                 grounded=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -189,6 +229,34 @@ class VisualizationAgent:
             return "box"
         return ct
 
+    @classmethod
+    def _is_toolkit_multi_chart(cls, request: str) -> bool:
+        """True when the user asked for two+ of box / heatmap / dual-axis in one request."""
+        req = request.lower()
+        n = 0
+        if any(k in req for k in ("box plot", "boxplot", "box chart")):
+            n += 1
+        if any(k in req for k in ("heatmap", "heat map")):
+            n += 1
+        if any(k in req for k in ("dual axis", "dual-axis", "dual chart", "two axis")):
+            n += 1
+        return n >= 2
+
+    @classmethod
+    def _dedupe_specs(cls, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep one spec per chart_type (LLM often emits 3× box/heatmap/dual = 9 charts)."""
+        seen: set[str] = set()
+        out: list[dict[str, Any]] = []
+        for s in specs:
+            ct = cls._normalize_chart_type_name(s.get("chart_type"))
+            if ct in seen:
+                continue
+            seen.add(ct)
+            s = dict(s)
+            s["chart_type"] = ct
+            out.append(s)
+        return out
+
     def _merge_missing_chart_types(
         self,
         request: str,
@@ -204,7 +272,7 @@ class VisualizationAgent:
         if any(k in req for k in ("dual axis", "dual-axis", "dual chart", "two axis")):
             wanted.add("dual_axis")
         if not wanted:
-            return specs
+            return self._dedupe_specs(specs)
         have = {self._normalize_chart_type_name(s.get("chart_type")) for s in specs}
         merged = list(specs)
         for hs in heuristic:
@@ -212,7 +280,7 @@ class VisualizationAgent:
             if ct in wanted and ct not in have:
                 merged.append(hs)
                 have.add(ct)
-        return merged
+        return self._dedupe_specs(merged)
 
     def _specs_from_analysis(self, request: str, workspace: SharedWorkspace) -> list[dict[str, Any]]:
         if not workspace.analysis_results:
@@ -450,7 +518,70 @@ class VisualizationAgent:
         cols = list(schema.keys())
         out = dict(spec)
 
-        # Already has concrete records — keep if plottable
+        chart_type = self._normalize_chart_type_name(out.get("chart_type"))
+        out["chart_type"] = chart_type
+
+        # Heatmap / box must use the raw dataset — never LLM-attached one-metric frames.
+        # Check chart_type BEFORE the data_records early-return (that path caused
+        # "heatmap requires a z column or at least two numeric columns").
+        if chart_type == "heatmap":
+            out["use_raw_dataset"] = True
+            out.pop("aggregation", None)
+            out.pop("data_records", None)
+            # Drop LLM axis guesses — correlation path owns column_a/b/correlation.
+            out.pop("x", None)
+            out.pop("y", None)
+            out.pop("y2", None)
+            out.pop("z", None)
+            out.setdefault("title", "How numeric columns relate")
+            return out
+
+        if chart_type == "box":
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
+                cols, _AMOUNT_HINTS
+            )
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
+                cols, _CATEGORY_HINTS
+            )
+            if not amount:
+                return None
+            out["chart_type"] = "box"
+            out["x"] = cat
+            out["y"] = amount
+            out["use_raw_dataset"] = True
+            out.pop("data_records", None)
+            out.pop("aggregation", None)
+            out.setdefault("title", f"{amount} by {cat}" if cat else f"Box plot of {amount}")
+            return out
+
+        if chart_type == "dual_axis":
+            from app.tools.dataset_tools import load_dataset
+
+            # Prefer rebuilding dual-axis from the dataset when available
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
+                cols, _CATEGORY_HINTS
+            )
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
+                cols, _AMOUNT_HINTS
+            )
+            if cat and amount and workspace.dataset:
+                df = load_dataset(workspace.dataset)
+                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
+                dual = (
+                    df.groupby(cat, as_index=False)
+                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
+                    .to_dict(orient="records")
+                )
+                return {
+                    "chart_type": "dual_axis",
+                    "title": out.get("title") or f"Revenue and order count by {cat}",
+                    "data_records": dual,
+                    "x": cat,
+                    "y": "revenue",
+                    "y2": "orders",
+                }
+
+        # Already has concrete records — keep if plottable (dual_axis / bar from analysis)
         if out.get("data_records"):
             records = out["data_records"]
             if isinstance(records, list) and records and isinstance(records[0], dict):
@@ -473,64 +604,9 @@ class VisualizationAgent:
                 return out
             return None
 
-        chart_type = (out.get("chart_type") or "bar").lower().replace("-", "_").replace(" ", "_")
-        if chart_type in {"dualaxis", "dual", "dual_axis_chart"}:
-            chart_type = "dual_axis"
-        if chart_type in {"heat_map", "corr_heatmap", "correlation_heatmap"}:
-            chart_type = "heatmap"
-        if chart_type in {"box_plot", "boxplot"}:
-            chart_type = "box"
-        out["chart_type"] = chart_type
-
-        if chart_type == "heatmap":
-            out["use_raw_dataset"] = True
-            out.pop("aggregation", None)
-            out.pop("data_records", None)
-            out.setdefault("title", "How numeric columns relate")
-            return out
-
-        if chart_type in {"box", "boxplot"}:
-            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
-                cols, _AMOUNT_HINTS
-            )
-            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
-                cols, _CATEGORY_HINTS
-            )
-            if not amount:
-                return None
-            out["chart_type"] = "box"
-            out["x"] = cat
-            out["y"] = amount
-            out["use_raw_dataset"] = True
-            out.setdefault("title", f"{amount} by {cat}" if cat else f"Box plot of {amount}")
-            return out
-
         if chart_type == "dual_axis":
-            from app.tools.dataset_tools import load_dataset
-
-            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
-                cols, _CATEGORY_HINTS
-            )
-            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
-                cols, _AMOUNT_HINTS
-            )
-            if not cat or not amount or not workspace.dataset:
-                return None
-            df = load_dataset(workspace.dataset)
-            id_col = self._resolve_column(cols, ("order_id", "id")) or amount
-            dual = (
-                df.groupby(cat, as_index=False)
-                .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
-                .to_dict(orient="records")
-            )
-            return {
-                "chart_type": "dual_axis",
-                "title": out.get("title") or f"Revenue and order count by {cat}",
-                "data_records": dual,
-                "x": cat,
-                "y": "revenue",
-                "y2": "orders",
-            }
+            # No dataset / columns to rebuild — drop
+            return None
 
         agg = out.get("aggregation")
         if isinstance(agg, dict) or out.get("group_by") or out.get("metric_column"):
@@ -624,26 +700,26 @@ class VisualizationAgent:
         return cls._resolve_column(cols, alias_hints)
 
     def _render_one(self, spec: dict[str, Any], workspace: SharedWorkspace) -> dict[str, Any]:
-        if spec.get("data_records") is not None:
+        chart_type = self._normalize_chart_type_name(spec.get("chart_type"))
+
+        # Heatmap / box always need the full dataset — ignore any data_records.
+        if chart_type in {"heatmap", "box"} or spec.get("use_raw_dataset"):
             return chart_tools.render_chart(
-                chart_type=spec.get("chart_type") or "bar",
+                chart_type=chart_type if chart_type != "box" else "box",
                 title=spec.get("title") or "Chart",
-                data_records=spec["data_records"],
+                dataset_meta=workspace.dataset,
                 x=spec.get("x"),
                 y=spec.get("y"),
                 y2=spec.get("y2"),
                 z=spec.get("z"),
                 color=spec.get("color"),
             )
-        if spec.get("use_raw_dataset") or (spec.get("chart_type") or "").lower() in {
-            "heatmap",
-            "heat_map",
-            "box",
-            "boxplot",
-        }:
+
+        if spec.get("data_records") is not None:
             return chart_tools.render_chart(
-                chart_type=spec.get("chart_type") or "histogram",
+                chart_type=chart_type or "bar",
                 title=spec.get("title") or "Chart",
+                data_records=spec["data_records"],
                 dataset_meta=workspace.dataset,
                 x=spec.get("x"),
                 y=spec.get("y"),
@@ -655,7 +731,7 @@ class VisualizationAgent:
         if aggregation and not aggregation.get("metric_column"):
             raise ValueError("Visualization aggregation is missing metric_column after normalization.")
         return chart_tools.render_chart(
-            chart_type=spec.get("chart_type") or "bar",
+            chart_type=chart_type or "bar",
             title=spec.get("title") or "Chart",
             dataset_meta=workspace.dataset,
             x=spec.get("x"),

@@ -105,7 +105,10 @@ class Orchestrator:
             if (
                 not result.success
                 and step.agent == "visualization_agent"
-                and "metric" in (result.error or "").lower()
+                and any(
+                    k in (result.error or "").lower()
+                    for k in ("metric", "heatmap", "z column", "numeric column", "dual_axis", "spec")
+                )
             ):
                 emit({"type": "retry", "agent": "visualization_agent", "reason": result.error})
                 retry_msg = AgentMessage(
@@ -304,7 +307,27 @@ class Orchestrator:
             steps=steps,
             summary=out.get("summary") or "LLM-generated execution plan",
         )
-        return self._augment_plan(llm_plan, heuristic)
+        return self._dedupe_viz_steps(self._augment_plan(llm_plan, heuristic))
+
+    @staticmethod
+    def _dedupe_viz_steps(plan: ExecutionPlan) -> ExecutionPlan:
+        """Keep a single visualization_agent step (also after augment)."""
+        deduped: list[PlanStep] = []
+        saw_viz = False
+        for step in plan.steps:
+            if step.agent == "visualization_agent":
+                if saw_viz:
+                    continue
+                saw_viz = True
+            deduped.append(step)
+        for i, step in enumerate(deduped, 1):
+            step.step_id = f"s{i}"
+        return ExecutionPlan(
+            task_id=plan.task_id,
+            user_request=plan.user_request,
+            steps=deduped,
+            summary=plan.summary,
+        )
 
     def _augment_plan(self, llm_plan: ExecutionPlan, heuristic: ExecutionPlan) -> ExecutionPlan:
         """Ensure capability steps from the heuristic plan are not dropped by the LLM."""
