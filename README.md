@@ -50,10 +50,15 @@ pip install -r requirements.txt
 
 # Optional LLM (works offline with heuristic planning if unset)
 cp .env.example .env
-# edit .env and set OPENAI_API_KEY
+# edit .env — set one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY
+# and optionally LLM_PROVIDER=openai|anthropic|google
 
 streamlit run app/ui.py
 ```
+
+In the sidebar, pick **AI model** → OpenAI, Claude, or Gemini. The model list is
+fetched live from each provider (newest chat models first); use **Refresh models**
+to reload. Only the API key for the selected provider is required.
 
 ## Acceptance test
 
@@ -74,7 +79,7 @@ app/
   orchestrator.py      # Root agent
   state.py             # Shared workspace
   messages.py          # Structured agent I/O
-  llm.py               # Optional OpenAI client + offline fallback
+  llm.py               # Optional multi-provider LLM client (OpenAI / Claude / Gemini)
   ui.py                # Streamlit interface
   agents/              # Specialized agents
   tools/               # Deterministic computation layer

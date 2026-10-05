@@ -16,7 +16,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.agents.dataset_agent import DatasetAgent
-from app.llm import LLMClient
+from app.llm import (
+    DEFAULT_PROVIDER,
+    LLMClient,
+    PROVIDERS,
+    clear_model_cache,
+    latest_model_for,
+    list_models,
+    resolve_provider,
+)
 from app.messages import AgentMessage
 from app.orchestrator import Orchestrator
 from app.state import SharedWorkspace, ensure_workspace
@@ -1054,6 +1062,13 @@ def _markdown_to_safe_html(text: str) -> str:
     return "\n".join(rendered)
 
 
+def build_llm_from_session() -> LLMClient:
+    """Create an LLM client from sidebar/session provider + model choices."""
+    provider = resolve_provider(st.session_state.get("llm_provider") or DEFAULT_PROVIDER)
+    model = st.session_state.get("llm_model") or latest_model_for(provider)
+    return LLMClient(provider=provider, model=model)
+
+
 def run_request(prompt: str) -> None:
     ws: SharedWorkspace = st.session_state.workspace
     messages = list(st.session_state.messages)
@@ -1064,7 +1079,7 @@ def run_request(prompt: str) -> None:
         events.append(event)
 
     with st.spinner("Orchestrator coordinating agents…"):
-        orch = Orchestrator()
+        orch = Orchestrator(llm=build_llm_from_session())
         ws = orch.run(prompt, workspace=ws, progress_callback=on_progress)
 
     messages.append({"role": "assistant", "content": ws.final_response or "Completed."})
@@ -1086,8 +1101,42 @@ def main() -> None:
             f"{ws_preview.task_status}</span>",
             unsafe_allow_html=True,
         )
-        llm = LLMClient()
-        st.caption("LLM: " + llm.status_label)
+        st.divider()
+        st.markdown("### AI model")
+        provider_ids = list(PROVIDERS.keys())
+        provider_labels = {pid: PROVIDERS[pid]["label"] for pid in provider_ids}
+        if "llm_provider" not in st.session_state:
+            st.session_state.llm_provider = resolve_provider()
+        provider = st.selectbox(
+            "Provider",
+            options=provider_ids,
+            format_func=lambda pid: provider_labels[pid],
+            key="llm_provider",
+        )
+        refresh_col, _ = st.columns([1, 2])
+        with refresh_col:
+            if st.button("Refresh models", use_container_width=True, key="llm_refresh_models"):
+                clear_model_cache(provider)
+                st.session_state.pop("llm_model", None)
+
+        with st.spinner("Loading latest models…"):
+            model_options = list_models(provider)
+        latest = model_options[0] if model_options else latest_model_for(provider)
+        if "llm_model" not in st.session_state or st.session_state.llm_model not in model_options:
+            st.session_state.llm_model = latest
+        st.selectbox(
+            "Model",
+            options=model_options,
+            key="llm_model",
+            help="Live list from the provider API, newest first. Default is the latest chat model.",
+        )
+        llm = build_llm_from_session()
+        st.caption(llm.status_label)
+        if model_options:
+            st.caption(f"Latest: `{latest}` · {len(model_options)} chat models")
+        env_key = PROVIDERS[provider]["env_key"]
+        if not llm.available:
+            st.caption(f"Set `{env_key}` in `.env` to enable this provider.")
         st.link_button("Reset workspace", url="?reset=1", use_container_width=True, type="primary")
 
         st.divider()
