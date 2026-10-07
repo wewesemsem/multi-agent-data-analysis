@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 from typing import Any
 
 from app.llm import LLMClient
@@ -86,31 +87,43 @@ class DatasetAgent:
         system = (
             "You produce JSON dataset specifications for a deterministic generator. "
             "Never invent row values. Return JSON with keys: name, n_rows, template "
-            "(ecommerce_orders|generic), seed. "
-            "For ecommerce_orders do NOT include a columns field — the generator has a fixed schema. "
-            "Only include columns for template=generic, as an object "
+            "(ecommerce_orders|generic), seed (integer). "
+            "Use template=ecommerce_orders ONLY when the user explicitly asks for e-commerce / orders data. "
+            "Otherwise use template=generic and include a columns object "
             '{"col_name": {"type": "string|int|float|bool"}} — never as a list. '
-            "Prefer template=ecommerce_orders for e-commerce / orders / transactions."
+            "For ecommerce_orders do NOT include a columns field — the generator has a fixed schema."
         )
         llm_out = self.llm.chat_json(system, f"User request: {user_text}\nHint n_rows={n_rows}")
         if llm_out.get("_offline") or llm_out.get("_fallback") or "template" not in llm_out:
             text_l = user_text.lower()
-            template = "ecommerce_orders" if any(
-                k in text_l for k in ("e-commerce", "ecommerce", "order", "transaction", "customer")
-            ) else "generic"
+            template = (
+                "ecommerce_orders"
+                if any(k in text_l for k in ("e-commerce", "ecommerce"))
+                else "generic"
+            )
             return {
                 "name": "ecommerce_orders" if template == "ecommerce_orders" else "synthetic_dataset",
                 "n_rows": int(n_rows),
                 "template": template,
-                "seed": 42,
+                "seed": secrets.randbelow(2**31),
             }
 
-        template = llm_out.get("template") or "ecommerce_orders"
+        text_l = user_text.lower()
+        template = llm_out.get("template") or "generic"
+        # Never silently coerce generic requests into the ecommerce template.
+        if "ecommerce" in str(template).lower() or "order" in str(template).lower():
+            if not any(k in text_l for k in ("e-commerce", "ecommerce", "order")):
+                template = "generic"
+        seed_raw = llm_out.get("seed")
+        try:
+            seed = int(seed_raw) if seed_raw is not None else secrets.randbelow(2**31)
+        except (TypeError, ValueError):
+            seed = secrets.randbelow(2**31)
         spec = {
             "name": llm_out.get("name") or "dataset",
             "n_rows": int(llm_out.get("n_rows") or n_rows),
             "template": template,
-            "seed": int(llm_out.get("seed") or 42),
+            "seed": seed,
         }
         # Ignore columns for ecommerce templates; normalize otherwise
         if llm_out.get("columns") and "ecommerce" not in str(template).lower() and "order" not in str(template).lower():

@@ -23,6 +23,10 @@ class ValidationAgent:
                 report = self._validate_anomalies(workspace, message.parameters)
             elif action == "validate_visualizations":
                 report = self._validate_visualizations(workspace, message.parameters)
+            elif action == "validate_forecasts":
+                report = self._validate_forecasts(workspace, message.parameters)
+            elif action == "validate_drafts":
+                report = self._validate_drafts(workspace, message.parameters)
             elif action in {"validate_all", "critique"}:
                 report = self._validate_all(workspace, message.parameters)
             else:
@@ -145,9 +149,56 @@ class ValidationAgent:
                     "boxplot",
                     "heatmap",
                     "dual_axis",
+                    "forecast",
                 }:
                     issues.append(f"Visualization[{i}] has unsupported chart_type.")
         return {"check": "visualizations", "ok": not issues, "issues": issues}
+
+    def _validate_forecasts(self, workspace: SharedWorkspace, params: dict[str, Any]) -> dict[str, Any]:
+        issues: list[str] = []
+        if not workspace.forecasts:
+            if params.get("required", True):
+                issues.append("No forecast results present.")
+            return {"check": "forecasts", "ok": not issues, "issues": issues}
+
+        from app.tools.forecast_tools import validate_forecast_payload
+
+        for i, item in enumerate(workspace.forecasts):
+            if not item.get("grounded"):
+                issues.append(f"Forecast[{i}] is not marked grounded.")
+            # Deterministic refusal is valid — must not look like a fabricated series
+            if item.get("suitable") is False:
+                if item.get("forecast_values"):
+                    issues.append(f"Forecast[{i}] marked unsuitable but contains forecast_values.")
+                if not (item.get("reason") or item.get("explanation")):
+                    issues.append(f"Forecast[{i}] unsuitable without explanation.")
+                continue
+            if item.get("suitable") is not True:
+                issues.append(f"Forecast[{i}] missing suitable flag.")
+                continue
+            for issue in validate_forecast_payload(item):
+                issues.append(f"Forecast[{i}] {issue}")
+            if not item.get("selected_method"):
+                issues.append(f"Forecast[{i}] missing selected_method.")
+            if not item.get("evaluation_metrics"):
+                issues.append(f"Forecast[{i}] missing evaluation_metrics.")
+            if not item.get("baseline_metrics"):
+                issues.append(f"Forecast[{i}] missing baseline_metrics.")
+        return {"check": "forecasts", "ok": not issues, "issues": issues}
+
+    def _validate_drafts(self, workspace: SharedWorkspace, params: dict[str, Any]) -> dict[str, Any]:
+        issues: list[str] = []
+        if not workspace.drafts:
+            if params.get("required", True):
+                issues.append("No draft artifacts present.")
+            return {"check": "drafts", "ok": not issues, "issues": issues}
+
+        from app.tools.draft_tools import validate_draft_payload
+
+        for i, item in enumerate(workspace.drafts):
+            for issue in validate_draft_payload(item, workspace):
+                issues.append(f"Draft[{i}] {issue}")
+        return {"check": "drafts", "ok": not issues, "issues": issues}
 
     def _validate_all(self, workspace: SharedWorkspace, params: dict[str, Any]) -> dict[str, Any]:
         expected = set(params.get("expected_outputs") or [])
@@ -163,14 +214,28 @@ class ValidationAgent:
             checks.append(self._validate_anomalies(workspace, {**params, "required": True}))
         elif workspace.anomalies:
             checks.append(self._validate_anomalies(workspace, {**params, "required": True}))
+        if "forecasts" in expected or params.get("require_forecasts"):
+            checks.append(self._validate_forecasts(workspace, {**params, "required": True}))
+        elif workspace.forecasts:
+            checks.append(self._validate_forecasts(workspace, {**params, "required": True}))
         if "visualizations" in expected or params.get("require_visualizations"):
             checks.append(self._validate_visualizations(workspace, {**params, "required": True}))
         elif workspace.visualizations:
             checks.append(self._validate_visualizations(workspace, {**params, "required": True}))
+        if "drafts" in expected or params.get("require_drafts"):
+            checks.append(self._validate_drafts(workspace, {**params, "required": True}))
+        elif workspace.drafts:
+            checks.append(self._validate_drafts(workspace, {**params, "required": True}))
 
         # Consistency: final claims should map to tool outputs in history
         history_ok = any(h.get("success") and h.get("agent") != "orchestrator" for h in workspace.agent_history)
-        if not history_ok and (workspace.analysis_results or workspace.anomalies or workspace.visualizations):
+        if not history_ok and (
+            workspace.analysis_results
+            or workspace.anomalies
+            or workspace.visualizations
+            or workspace.forecasts
+            or workspace.drafts
+        ):
             checks.append(
                 {
                     "check": "history",
@@ -198,6 +263,10 @@ class ValidationAgent:
             targets.append("analysis_agent")
         if "anomaly" in joined:
             targets.append("anomaly_agent")
+        if "forecast" in joined:
+            targets.append("forecasting_agent")
         if "visual" in joined:
             targets.append("visualization_agent")
+        if "draft" in joined:
+            targets.append("drafting_agent")
         return targets

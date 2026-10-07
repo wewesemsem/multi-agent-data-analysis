@@ -39,12 +39,17 @@ def _slug(name: str) -> str:
 def create_ecommerce_orders(
     *,
     n_rows: int = 10_000,
-    seed: int = 42,
+    seed: int | None = None,
     name: str = "ecommerce_orders",
     extra_columns: dict[str, Any] | None = None,
+    inject_outliers: bool = False,
 ) -> dict[str, Any]:
     """Generate a synthetic e-commerce orders dataset with deterministic RNG."""
+    import secrets
+
     ensure_workspace()
+    if seed is None:
+        seed = secrets.randbelow(2**31)
     rng = np.random.default_rng(seed)
     fake = Faker()
     Faker.seed(seed)
@@ -71,10 +76,11 @@ def create_ecommerce_orders(
         lo, hi = base_prices[cat]
         amounts[mask] = rng.uniform(lo, hi, size=mask.sum())
 
-    # Inject ~1.5% extreme outliers for anomaly detection demos
-    n_outliers = max(1, int(n_rows * 0.015))
-    outlier_idx = rng.choice(n_rows, size=n_outliers, replace=False)
-    amounts[outlier_idx] = amounts[outlier_idx] * rng.uniform(8, 25, size=n_outliers)
+    # Optional extreme outliers (off by default — not injected for live demos)
+    if inject_outliers:
+        n_outliers = max(1, int(n_rows * 0.015))
+        outlier_idx = rng.choice(n_rows, size=n_outliers, replace=False)
+        amounts[outlier_idx] = amounts[outlier_idx] * rng.uniform(8, 25, size=n_outliers)
 
     quantities = rng.integers(1, 6, size=n_rows)
     start = np.datetime64("2024-01-01")
@@ -245,11 +251,18 @@ def generate_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "columns": {"col": {"type": "float"}}  # or list[{name, type}] from LLM
       }
     """
-    template = (spec.get("template") or "ecommerce_orders").lower()
+    import secrets
+
+    template = (spec.get("template") or "generic").lower()
     n_rows = int(spec.get("n_rows") or spec.get("rows") or 1000)
-    seed = int(spec.get("seed") or 42)
+    seed_raw = spec.get("seed")
+    try:
+        seed = int(seed_raw) if seed_raw is not None else secrets.randbelow(2**31)
+    except (TypeError, ValueError):
+        seed = secrets.randbelow(2**31)
     name = spec.get("name") or _slug(template)
     columns = _normalize_columns_spec(spec.get("columns"))
+    inject_outliers = bool(spec.get("inject_outliers"))
 
     if "e-commerce" in template or "ecommerce" in template or "order" in template:
         # Ecommerce generator already has a full schema; only pass true extras.
@@ -272,6 +285,7 @@ def generate_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
             seed=seed,
             name=name,
             extra_columns=extras,
+            inject_outliers=inject_outliers,
         )
 
     # Generic fallback: simple tabular data

@@ -86,15 +86,18 @@ class AnomalyAgent:
         system = (
             "Choose anomaly detection parameters. Return JSON: "
             '{"column":"...","method":"iqr|zscore|isolation_forest|auto"}. '
-            "Prefer amount/total columns for transactions. Use iqr for skewed spend data. "
+            "Pick a numeric column from the provided schema that matches the user request. "
+            "Use iqr for skewed distributions. "
             "method MUST be exactly one of: iqr, zscore, isolation_forest, auto."
         )
         out = self.llm.chat_json(system, f"Request params: {parameters}\nSchema: {schema}")
         if out.get("_offline") or out.get("_fallback") or "column" not in out:
+            from app.schema_utils import default_metric_column, match_column
+
             cols = list(schema.keys())
-            column = next(
-                (c for c in cols if any(k in c.lower() for k in ("total_amount", "amount", "price", "value"))),
-                None,
+            column = (
+                match_column(cols, "amount", "price", "value", "revenue", "sales", "total")
+                or default_metric_column(schema, cols)
             )
             return {
                 "column": parameters.get("column") or column,

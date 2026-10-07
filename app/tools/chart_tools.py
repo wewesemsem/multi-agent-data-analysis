@@ -139,16 +139,10 @@ def _aggregate(meta: dict[str, Any], aggregation: dict[str, Any]) -> pd.DataFram
 
     metric = coerce_column_ref(aggregation.get("metric_column"))
     if not metric:
+        from app.schema_utils import default_metric_column
+
         schema = meta.get("schema") or {}
-        cols = list(schema.keys())
-        metric = next(
-            (
-                c
-                for c in cols
-                if any(k in c.lower() for k in ("total_amount", "amount", "revenue", "value", "price"))
-            ),
-            None,
-        )
+        metric = default_metric_column(schema)
         if not metric:
             raise ValueError("Aggregation requires a metric_column present in the dataset.")
         aggregation = {**aggregation, "metric_column": metric}
@@ -253,3 +247,142 @@ def choose_chart_type(intent: str, columns_info: dict[str, Any] | None = None) -
     if any(k in intent_l for k in ("scatter", "relationship", "correlation")):
         return "scatter"
     return "bar"
+
+
+def render_forecast_chart(
+    forecast: dict[str, Any],
+    *,
+    title: str | None = None,
+    dataset_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Render historical + forecast series with optional prediction band."""
+    ensure_workspace()
+    if not forecast.get("suitable"):
+        raise ValueError("Cannot chart an unsuitable forecast artifact.")
+    hist = forecast.get("historical_values") or []
+    future = forecast.get("forecast_values") or []
+    if not hist or not future:
+        raise ValueError("Forecast chart requires historical_values and forecast_values.")
+
+    target = forecast.get("target_column") or "value"
+    method = forecast.get("selected_method") or "forecast"
+    frequency = forecast.get("frequency") or "period"
+    hz = forecast.get("forecast_horizon")
+    chart_title = title or f"{target} · {hz} {frequency} forecast ({method})"
+
+    fig = go.Figure()
+    # Ensure chronological order for Plotly (ISO strings / mixed types)
+    hist = sorted(hist, key=lambda r: str(r.get("time")))
+    future = sorted(future, key=lambda r: str(r.get("time")))
+    hist_x = [row.get("time") for row in hist]
+    hist_y = [row.get("value") for row in hist]
+    fig.add_trace(
+        go.Scatter(
+            x=hist_x,
+            y=hist_y,
+            mode="lines+markers",
+            name="Historical",
+            line=dict(color="#1f77b4"),
+        )
+    )
+
+    fc_x = [row.get("time") for row in future]
+    fc_y = [row.get("value") for row in future]
+    # Bridge last historical point to first forecast for visual continuity
+    bridge_x = [hist_x[-1], fc_x[0]] if hist_x and fc_x else fc_x
+    bridge_y = [hist_y[-1], fc_y[0]] if hist_y and fc_y else fc_y
+    fig.add_trace(
+        go.Scatter(
+            x=bridge_x + fc_x[1:],
+            y=bridge_y + fc_y[1:],
+            mode="lines+markers",
+            name="Forecast",
+            line=dict(color="#ff7f0e", dash="dash"),
+        )
+    )
+
+    lower = [row.get("lower") for row in future]
+    upper = [row.get("upper") for row in future]
+    if any(v is not None for v in lower) and any(v is not None for v in upper):
+        fig.add_trace(
+            go.Scatter(
+                x=fc_x + fc_x[::-1],
+                y=list(upper) + list(lower[::-1]),
+                fill="toself",
+                fillcolor="rgba(255, 127, 14, 0.15)",
+                line=dict(color="rgba(255,127,14,0)"),
+                name="Prediction interval",
+                hoverinfo="skip",
+            )
+        )
+
+    fig.update_layout(
+        title=dict(text=chart_title, y=0.98, x=0.01, xanchor="left", yanchor="top"),
+        xaxis_title=str(forecast.get("time_column") or "time"),
+        yaxis_title=str(target),
+        xaxis=dict(type="date", title_standoff=12),
+        margin=dict(l=56, r=24, t=72, b=64),
+        template="plotly_white",
+        # Keep legend above the plot so it cannot collide with the x-axis title.
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(255,255,255,0.85)",
+        ),
+        annotations=[
+            dict(
+                text=f"Horizon: {hz} {frequency} · method: {method}",
+                xref="paper",
+                yref="paper",
+                x=1,
+                y=1.14,
+                xanchor="right",
+                yanchor="bottom",
+                showarrow=False,
+                font=dict(size=11, color="#555"),
+            )
+        ],
+    )
+
+    chart_id = f"chart_{uuid.uuid4().hex[:10]}"
+    html_path = CHARTS_DIR / f"{chart_id}.html"
+    json_path = CHARTS_DIR / f"{chart_id}.json"
+    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+    fig_json = json.loads(pio.to_json(fig))
+    json_path.write_text(json.dumps(fig_json))
+
+    preview_rows = [
+        {"series": "historical", "time": r.get("time"), "value": r.get("value")} for r in hist[-20:]
+    ] + [
+        {
+            "series": "forecast",
+            "time": r.get("time"),
+            "value": r.get("value"),
+            "lower": r.get("lower"),
+            "upper": r.get("upper"),
+        }
+        for r in future
+    ]
+    preview = [{k: _jsonify(v) for k, v in row.items()} for row in preview_rows]
+
+    return {
+        "id": chart_id,
+        "chart_type": "forecast",
+        "title": chart_title,
+        "x": forecast.get("time_column"),
+        "y": target,
+        "y2": None,
+        "z": None,
+        "color": None,
+        "html_path": str(html_path),
+        "json_path": str(json_path),
+        "n_points": int(len(hist) + len(future)),
+        "data_preview": preview,
+        "grounded": True,
+        "source_dataset_id": (dataset_meta or {}).get("id") or forecast.get("source_dataset_id"),
+        "plotly_json": fig_json,
+        "forecast_id": forecast.get("id"),
+    }

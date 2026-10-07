@@ -15,7 +15,7 @@ User
   ↓
 Orchestrator (root agent)
   ↓
-Specialized Agents (dataset | analysis | anomaly | visualization | validation)
+Specialized Agents (dataset | analysis | anomaly | forecasting | visualization | drafting | validation)
   ↓
 Shared Workspace / Environment
   ↓
@@ -37,8 +37,13 @@ anomaly labels, and charts always come from deterministic execution.
 | Dataset Agent | Spec → synthetic generation / CSV load / profile |
 | Analysis Agent | Question → SQL/aggregation → explanation |
 | Anomaly Agent | IQR / Z-score / Isolation Forest |
-| Visualization Agent | Chart spec → Plotly render |
+| Forecasting Agent | Time-series inspect → method selection → forecast |
+| Visualization Agent | Chart spec → Plotly render (incl. forecast charts) |
+| Drafting Agent | Synthesize validated evidence into reports/summaries/memos/assessments |
 | Validation Agent | Grounding and consistency checks |
+
+Completed drafts can optionally be exported from the **Drafts** tab as **PDF** or **DOCX**
+(structured artifact → presentation layer; analysis is not re-run).
 
 ## Quick start
 
@@ -48,7 +53,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Optional LLM (works offline with heuristic planning if unset)
+# Required for live use — missing keys fail loudly (no silent offline demos)
 cp .env.example .env
 # edit .env — set one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY
 # and optionally LLM_PROVIDER=openai|anthropic|google
@@ -56,9 +61,12 @@ cp .env.example .env
 streamlit run app/ui.py
 ```
 
-In the sidebar, pick **AI model** → OpenAI, Claude, or Gemini. The model list is
-fetched live from each provider (newest chat models first); use **Refresh models**
+In the sidebar, pick **AI model** → OpenAI, Claude, or Gemini. The model list shows
+the latest 3 chat models from each provider (newest first); use **Refresh models**
 to reload. Only the API key for the selected provider is required.
+
+Upload a CSV (or explicitly ask to create synthetic data). The system will not
+auto-generate ecommerce data for analysis questions.
 
 ## Acceptance test
 
@@ -96,10 +104,10 @@ later target BigQuery, Postgres/AlloyDB, or Cloud Storage.
 ## Known MVP limitations
 
 - Single-user, in-process shared state (no distributed messaging)
-- Offline mode uses heuristic planning when no API key is configured
+- Live mode requires an API key; CI may set `MAS_ALLOW_OFFLINE_HEURISTICS=1` for keyword planning
 - SQL is read-only against a registered DuckDB view (not arbitrary sandbox code)
 - No auth, multi-tenancy, or production observability
-- Chart types limited to bar / line / scatter / histogram
+- Chart types include bar / line / scatter / histogram / pie / box / heatmap / dual_axis
 
 ## V2 recommendations
 

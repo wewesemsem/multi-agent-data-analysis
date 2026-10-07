@@ -18,7 +18,7 @@ def test_explore_routes_to_analysis_and_dataset_agents():
     ws = SharedWorkspace()
     ws.dataset = dataset_tools.create_ecommerce_orders(n_rows=400, seed=21)
     prompt = "Explore the data — show how columns relate, missing values, and typical ranges."
-    # Offline / no API key → heuristic plan, but still must run explore agents
+    # CI enables MAS_ALLOW_OFFLINE_HEURISTICS → heuristic plan still runs explore agents
     ws = orch.run(prompt, workspace=ws)
     agents = {h["agent"] for h in ws.agent_history if h.get("success")}
     assert "analysis_agent" in agents
@@ -131,7 +131,7 @@ def test_heatmap_ignores_bad_data_records_and_dedupes_llm_specs():
         "Create a box plot of order amounts by category, a heatmap of how numeric "
         "columns relate, and a dual-axis chart of revenue and order count by category."
     )
-    # Toolkit multi-chart path forces heuristics (ignores specs) — still assert 3 charts
+    # Explicit specs are normalized/deduped (heatmap recovers via raw dataset)
     result = agent.handle(
         AgentMessage(
             task_id="t2",
@@ -173,3 +173,42 @@ def test_heatmap_ignores_bad_data_records_and_dedupes_llm_specs():
     )
     assert result2.success, result2.error
     assert result2.data["charts"][0]["chart_type"] == "heatmap"
+
+
+def test_explore_without_dataset_is_not_llm_unavailable():
+    """Explore with an empty workspace must fail closed clearly — not as 'LLM unavailable'."""
+    orch = Orchestrator()
+    ws = SharedWorkspace()
+    ws = orch.run(
+        "Explore the data — show how columns relate, missing values, and typical ranges.",
+        workspace=ws,
+    )
+    assert ws.task_status == "failed"
+    final = (ws.final_response or "").lower()
+    assert "llm unavailable" not in final
+    assert "dataset" in final
+    assert ws.dataset is None
+
+
+def test_explore_falls_back_when_llm_returns_empty_steps():
+    """Live LLM can return [] for Explore; capability intents must still run agents."""
+
+    class EmptyPlanLLM:
+        def chat_json(self, system: str, user: str, *, temperature: float = 0.1) -> dict:
+            return {"summary": "no steps", "steps": []}
+
+        def chat_text(self, system: str, user: str, *, temperature: float = 0.2) -> str:
+            return ""
+
+    orch = Orchestrator(llm=EmptyPlanLLM())  # type: ignore[arg-type]
+    ws = SharedWorkspace()
+    ws.dataset = dataset_tools.create_ecommerce_orders(n_rows=300, seed=26)
+    ws = orch.run(
+        "Explore the data — show how columns relate, missing values, and typical ranges.",
+        workspace=ws,
+    )
+    agents = {h["agent"] for h in ws.agent_history if h.get("success")}
+    assert "analysis_agent" in agents
+    assert "dataset_agent" in agents
+    assert ws.task_status in {"completed", "completed_with_warnings"}
+    assert "llm unavailable" not in (ws.final_response or "").lower()

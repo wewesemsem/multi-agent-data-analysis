@@ -6,14 +6,22 @@ from typing import Any
 
 from app.llm import LLMClient
 from app.messages import AgentMessage, AgentResult
+from app.schema_utils import (
+    default_group_column,
+    default_id_column,
+    default_metric_column,
+    default_time_column,
+    match_column,
+)
 from app.state import SharedWorkspace
 from app.tools import chart_tools
 from app.tools.query_tools import coerce_column_ref
 
 
-_AMOUNT_HINTS = ("total_amount", "revenue", "amount", "unit_price", "value", "price", "sales")
-_CATEGORY_HINTS = ("product_category", "category", "categories", "segment", "type")
-_DATE_HINTS = ("order_date", "date", "timestamp", "created_at", "time")
+# Alias tokens for mapping user/LLM language onto schema names — not preferred defaults.
+_AMOUNT_ALIASES = ("revenue", "amount", "sales", "value", "price", "total", "unit_price", "total_amount")
+_CATEGORY_ALIASES = ("category", "categories", "segment", "type", "group", "region", "product_category")
+_DATE_ALIASES = ("date", "timestamp", "created_at", "time", "order_date")
 
 
 class VisualizationAgent:
@@ -34,12 +42,16 @@ class VisualizationAgent:
                     error=f"Unknown visualization action: {action}",
                     grounded=False,
                 )
-            if not workspace.dataset and not message.parameters.get("data_records"):
-                raise ValueError("No dataset or data_records available for visualization.")
+            if (
+                not workspace.dataset
+                and not message.parameters.get("data_records")
+                and not any(f.get("suitable") for f in (workspace.forecasts or []))
+            ):
+                raise ValueError("No dataset, data_records, or forecast artifacts available for visualization.")
 
-            # Replace charts for this run (avoids stacking when the planner emits
-            # multiple visualization steps or the user re-runs a demo).
-            workspace.visualizations = []
+            # Append to the shared workspace — prior charts (e.g. forecast) stay
+            # until the user resets. Deduping within this request is handled by
+            # _dedupe_specs; the orchestrator keeps a single viz step per plan.
 
             request = (
                 message.parameters.get("user_request")
@@ -48,10 +60,14 @@ class VisualizationAgent:
             )
             schema = (workspace.dataset or {}).get("schema", {})
 
-            specs = message.parameters.get("specs")
-            # Explicit box+heatmap+dual toolkit requests are deterministic — skip flaky
-            # LLM specs that often attach one-metric data_records to heatmaps.
-            if message.parameters.get("force_heuristic") or self._is_toolkit_multi_chart(request):
+            # Hard override: never let the LLM emit a plain line chart titled
+            # "Revenue Forecast…" when a suitable forecast artifact exists.
+            if self._wants_forecast_chart(request, workspace):
+                specs = self._specs_from_forecasts(request, workspace)
+            else:
+                specs = message.parameters.get("specs")
+            # force_heuristic is only for orchestrator recovery after a failed LLM viz step.
+            if specs is None and message.parameters.get("force_heuristic"):
                 specs = self._heuristic_specs(request, schema, workspace)
             elif not specs:
                 specs = self._plan_specs(message.parameters, workspace)
@@ -71,6 +87,15 @@ class VisualizationAgent:
 
             created = []
             errors: list[str] = []
+            # If we are about to render grounded forecast chart(s), drop prior
+            # misleading "Revenue Forecast (line)" placeholders from the workspace.
+            if any(self._normalize_chart_type_name(s.get("chart_type")) == "forecast" for s in specs):
+                workspace.visualizations = [
+                    v
+                    for v in (workspace.visualizations or [])
+                    if v.get("chart_type") != "forecast"
+                    and "forecast" not in str(v.get("title") or "").lower()
+                ]
             for spec in specs:
                 try:
                     chart = self._render_one(spec, workspace)
@@ -165,6 +190,12 @@ class VisualizationAgent:
         schema = (workspace.dataset or {}).get("schema", {})
         cols = list(schema.keys())
 
+        # When a forecast just ran (or the user asked to chart one), prefer the
+        # grounded forecast artifact over a plain line/bar of raw history.
+        forecast_specs = self._specs_from_forecasts(request, workspace)
+        if forecast_specs and self._wants_forecast_chart(request, workspace):
+            return forecast_specs
+
         # Prefer charting grounded analysis results when they already answer the request.
         # Skip this reuse for explicit multi-chart / new-type intents so LLM specs cannot
         # accidentally chart aggregated one-metric frames as heatmaps.
@@ -187,16 +218,18 @@ class VisualizationAgent:
 
         system = (
             "Return JSON {\"specs\":[...]} where each spec has: "
-            "chart_type (bar|line|scatter|histogram|pie|box|heatmap|dual_axis), title, "
+            "chart_type (bar|line|scatter|histogram|pie|box|heatmap|dual_axis|forecast), title, "
             "aggregation optional {group_by, metric_column, agg}, "
             "x, y, y2, color optional. "
             f"Use ONLY these exact column names: {cols}. "
-            "Never invent column names like 'revenue' — use total_amount when that exists. "
+            "Never invent column names — map user language (e.g. revenue) to a real schema column. "
             "metric_column and group_by must be non-null when aggregation is used. "
             "If the user asks for a pie chart, set chart_type to pie. "
             "If the user asks for a box plot, set chart_type to box. "
             "If the user asks for a heatmap / correlation heat map, set chart_type to heatmap. "
             "If the user asks for dual-axis / two metrics together, set chart_type to dual_axis. "
+            "If the user asks to chart a forecast / prediction / projection and forecast "
+            "artifacts exist, set chart_type to forecast (do not use a plain line chart). "
             "If the user asks for both category revenue and amount distribution, return TWO specs."
         )
         out = self.llm.chat_json(system, f"Request: {request}\nSchema: {schema}")
@@ -208,6 +241,10 @@ class VisualizationAgent:
                 for s in specs:
                     if (s.get("chart_type") or "").lower() in {"bar", "", "none"}:
                         s["chart_type"] = "pie"
+            # Replace plain line/bar "forecast" charts with grounded forecast specs
+            if forecast_specs and self._wants_forecast_chart(request, workspace):
+                if not any(self._normalize_chart_type_name(s.get("chart_type")) == "forecast" for s in specs):
+                    return forecast_specs
             # Ensure distribution chart is present when requested even if LLM omitted it
             if self._wants_distribution(request) and not any(
                 (s.get("chart_type") or "").lower() == "histogram" for s in specs
@@ -219,6 +256,25 @@ class VisualizationAgent:
         return heuristic
 
     @staticmethod
+    def _wants_forecast_chart(request: str, workspace: SharedWorkspace) -> bool:
+        """True when the request is about forecasting and suitable artifacts exist."""
+        if not any(f.get("suitable") for f in (workspace.forecasts or [])):
+            return False
+        req = (request or "").lower()
+        keys = (
+            "forecast",
+            "predict",
+            "prediction",
+            "projection",
+            "projected",
+            "next month",
+            "next year",
+            "next quarter",
+            "future",
+        )
+        return any(k in req for k in keys)
+
+    @staticmethod
     def _normalize_chart_type_name(chart_type: str | None) -> str:
         ct = (chart_type or "bar").lower().replace("-", "_").replace(" ", "_")
         if ct in {"dualaxis", "dual", "dual_axis_chart"}:
@@ -227,7 +283,27 @@ class VisualizationAgent:
             return "heatmap"
         if ct in {"box_plot", "boxplot"}:
             return "box"
+        if ct in {"forecast_line", "forecast_chart", "prediction"}:
+            return "forecast"
         return ct
+
+    @staticmethod
+    def _specs_from_forecasts(request: str, workspace: SharedWorkspace) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for fc in workspace.forecasts or []:
+            if not fc.get("suitable"):
+                continue
+            target = fc.get("target_column") or "value"
+            method = fc.get("selected_method") or "forecast"
+            specs.append(
+                {
+                    "chart_type": "forecast",
+                    "title": f"{target} forecast ({method})",
+                    "forecast_id": fc.get("id"),
+                    "forecast": fc,
+                }
+            )
+        return specs
 
     @classmethod
     def _is_toolkit_multi_chart(cls, request: str) -> bool:
@@ -244,14 +320,20 @@ class VisualizationAgent:
 
     @classmethod
     def _dedupe_specs(cls, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Keep one spec per chart_type (LLM often emits 3× box/heatmap/dual = 9 charts)."""
+        """Keep one spec per chart_type (LLM often emits 3× box/heatmap/dual = 9 charts).
+
+        Forecast charts are keyed by forecast_id so multiple targets can render.
+        """
         seen: set[str] = set()
         out: list[dict[str, Any]] = []
         for s in specs:
             ct = cls._normalize_chart_type_name(s.get("chart_type"))
-            if ct in seen:
+            key = ct
+            if ct == "forecast":
+                key = f"forecast:{s.get('forecast_id') or s.get('title') or len(out)}"
+            if key in seen:
                 continue
-            seen.add(ct)
+            seen.add(key)
             s = dict(s)
             s["chart_type"] = ct
             out.append(s)
@@ -306,7 +388,10 @@ class VisualizationAgent:
         x = keys[0]
         y = "value" if "value" in keys else keys[1]
         title = "Revenue by Product Category" if "categor" in req else "Analysis Result"
-        chart_type = chart_tools.choose_chart_type(request)
+        # Aggregated analysis rows are categorical comparisons — not distributions.
+        # Avoid choose_chart_type(full request): "distribution" elsewhere would force
+        # histogram and then collide with the dedicated distribution chart in dedupe.
+        chart_type = "pie" if self._wants_pie(request) else "bar"
         return [
             {
                 "chart_type": chart_type,
@@ -330,18 +415,28 @@ class VisualizationAgent:
     def _extra_distribution_specs(self, request: str, schema: dict[str, Any]) -> list[dict[str, Any]]:
         if not self._wants_distribution(request):
             return []
-        amount = self._resolve_column(list(schema.keys()), _AMOUNT_HINTS)
+        cols = list(schema.keys())
+        amount = self._default_metric(cols, schema)
         if not amount:
             return []
         return [
             {
                 "chart_type": "histogram",
-                "title": "Distribution of Transaction Amounts",
+                "title": f"Distribution of {amount}",
                 "x": amount,
                 "y": None,
                 "use_raw_dataset": True,
             }
         ]
+
+    def _default_metric(self, cols: list[str], schema: dict[str, Any]) -> str | None:
+        return match_column(cols, *_AMOUNT_ALIASES) or default_metric_column(schema, cols)
+
+    def _default_category(self, cols: list[str], schema: dict[str, Any]) -> str | None:
+        return match_column(cols, *_CATEGORY_ALIASES) or default_group_column(schema, cols)
+
+    def _default_date(self, cols: list[str], schema: dict[str, Any]) -> str | None:
+        return match_column(cols, *_DATE_ALIASES) or default_time_column(schema, cols)
 
     def _heuristic_specs(
         self, request: str, schema: dict[str, Any], workspace: SharedWorkspace
@@ -350,9 +445,18 @@ class VisualizationAgent:
         req = request.lower()
         specs: list[dict[str, Any]] = []
 
-        cat = self._resolve_column(cols, _CATEGORY_HINTS)
-        amount = self._resolve_column(cols, _AMOUNT_HINTS)
-        date = self._resolve_column(cols, _DATE_HINTS)
+        # Prefer grounded forecast artifacts only when the user asked to chart a
+        # forecast. Do not steal unrelated requests (e.g. "visualize revenue")
+        # just because forecasts already exist in the workspace.
+        forecast_specs = self._specs_from_forecasts(request, workspace)
+        if forecast_specs and any(
+            k in req for k in ("forecast", "predict", "projection", "projected")
+        ):
+            return forecast_specs
+
+        cat = self._default_category(cols, schema)
+        amount = self._default_metric(cols, schema)
+        date = self._default_date(cols, schema)
         chart_type = chart_tools.choose_chart_type(request)
 
         # Multi-intent: box + heatmap + dual in one request
@@ -376,26 +480,9 @@ class VisualizationAgent:
                 }
             )
         if any(k in req for k in ("dual axis", "dual-axis", "dual chart", "two axis")) and cat and amount:
-            from app.tools.dataset_tools import load_dataset
-
-            df = load_dataset(workspace.dataset) if workspace.dataset else None
-            if df is not None and cat in df.columns and amount in df.columns:
-                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
-                dual = (
-                    df.groupby(cat, as_index=False)
-                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
-                    .to_dict(orient="records")
-                )
-                multi_specs.append(
-                    {
-                        "chart_type": "dual_axis",
-                        "title": f"Revenue and order count by {cat}",
-                        "data_records": dual,
-                        "x": cat,
-                        "y": "revenue",
-                        "y2": "orders",
-                    }
-                )
+            dual_spec = self._dual_axis_spec(cols, schema, workspace, cat, amount)
+            if dual_spec:
+                multi_specs.append(dual_spec)
         if len(multi_specs) >= 2:
             return multi_specs
         if len(multi_specs) == 1:
@@ -423,40 +510,22 @@ class VisualizationAgent:
             )
             return specs
         if chart_type == "dual_axis" and cat and amount:
-            from app.tools.dataset_tools import load_dataset
+            dual_spec = self._dual_axis_spec(cols, schema, workspace, cat, amount)
+            if dual_spec:
+                return [dual_spec]
 
-            df = load_dataset(workspace.dataset) if workspace.dataset else None
-            if df is not None and cat in df.columns and amount in df.columns:
-                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
-                dual = (
-                    df.groupby(cat, as_index=False)
-                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
-                    .to_dict(orient="records")
-                )
-                specs.append(
-                    {
-                        "chart_type": "dual_axis",
-                        "title": f"Revenue and order count by {cat}",
-                        "data_records": dual,
-                        "x": cat,
-                        "y": "revenue",
-                        "y2": "orders",
-                    }
-                )
-                return specs
-
-        want_revenue_by_cat = (
-            ("categor" in req and any(k in req for k in ("revenue", "visual", "chart", "show", "pie")))
-            or "revenue by category" in req
+        want_grouped = (
+            ("categor" in req and any(k in req for k in ("revenue", "visual", "chart", "show", "pie", "by")))
+            or "by category" in req
             or self._wants_pie(request)
         )
         want_dist = "distribution" in req or "histogram" in req or "transaction amount" in req
 
-        if want_revenue_by_cat and cat and amount:
+        if want_grouped and cat and amount:
             specs.append(
                 {
                     "chart_type": chart_type if chart_type in {"bar", "pie"} else "bar",
-                    "title": "Revenue by Product Category",
+                    "title": f"{amount} by {cat}",
                     "aggregation": {"group_by": cat, "metric_column": amount, "agg": "sum"},
                     "x": cat,
                     "y": "value",
@@ -466,7 +535,7 @@ class VisualizationAgent:
             specs.append(
                 {
                     "chart_type": "histogram",
-                    "title": "Distribution of Transaction Amounts",
+                    "title": f"Distribution of {amount}",
                     "x": amount,
                     "y": None,
                     "use_raw_dataset": True,
@@ -507,6 +576,36 @@ class VisualizationAgent:
                 )
         return specs
 
+    def _dual_axis_spec(
+        self,
+        cols: list[str],
+        schema: dict[str, Any],
+        workspace: SharedWorkspace,
+        cat: str,
+        amount: str,
+    ) -> dict[str, Any] | None:
+        from app.tools.dataset_tools import load_dataset
+
+        if not workspace.dataset:
+            return None
+        df = load_dataset(workspace.dataset)
+        if cat not in df.columns or amount not in df.columns:
+            return None
+        id_col = default_id_column(schema, cols) or amount
+        dual = (
+            df.groupby(cat, as_index=False)
+            .agg(**{"metric_sum": (amount, "sum"), "row_count": (id_col, "count")})
+            .to_dict(orient="records")
+        )
+        return {
+            "chart_type": "dual_axis",
+            "title": f"{amount} and count by {cat}",
+            "data_records": dual,
+            "x": cat,
+            "y": "metric_sum",
+            "y2": "row_count",
+        }
+
     def _normalize_spec(
         self,
         spec: dict[str, Any],
@@ -520,6 +619,33 @@ class VisualizationAgent:
 
         chart_type = self._normalize_chart_type_name(out.get("chart_type"))
         out["chart_type"] = chart_type
+
+        # Forecast charts are rendered from SharedWorkspace.forecasts artifacts.
+        if chart_type == "forecast":
+            forecast = out.get("forecast")
+            if forecast is None and out.get("forecast_id"):
+                forecast = next(
+                    (
+                        f
+                        for f in (workspace.forecasts or [])
+                        if f.get("id") == out.get("forecast_id")
+                    ),
+                    None,
+                )
+            if forecast is None:
+                suitable = [f for f in (workspace.forecasts or []) if f.get("suitable")]
+                forecast = suitable[-1] if suitable else None
+            if not forecast or not forecast.get("suitable"):
+                return None
+            out["forecast"] = forecast
+            out["forecast_id"] = forecast.get("id")
+            out.setdefault(
+                "title",
+                f"{forecast.get('target_column')} forecast ({forecast.get('selected_method')})",
+            )
+            out.pop("aggregation", None)
+            out.pop("data_records", None)
+            return out
 
         # Heatmap / box must use the raw dataset — never LLM-attached one-metric frames.
         # Check chart_type BEFORE the data_records early-return (that path caused
@@ -537,11 +663,11 @@ class VisualizationAgent:
             return out
 
         if chart_type == "box":
-            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
-                cols, _AMOUNT_HINTS
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_ALIASES) or self._default_metric(
+                cols, schema
             )
-            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
-                cols, _CATEGORY_HINTS
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_ALIASES) or self._default_category(
+                cols, schema
             )
             if not amount:
                 return None
@@ -555,31 +681,18 @@ class VisualizationAgent:
             return out
 
         if chart_type == "dual_axis":
-            from app.tools.dataset_tools import load_dataset
-
             # Prefer rebuilding dual-axis from the dataset when available
-            cat = self._map_column(out.get("x"), cols, _CATEGORY_HINTS) or self._resolve_column(
-                cols, _CATEGORY_HINTS
+            cat = self._map_column(out.get("x"), cols, _CATEGORY_ALIASES) or self._default_category(
+                cols, schema
             )
-            amount = self._map_column(out.get("y"), cols, _AMOUNT_HINTS) or self._resolve_column(
-                cols, _AMOUNT_HINTS
+            amount = self._map_column(out.get("y"), cols, _AMOUNT_ALIASES) or self._default_metric(
+                cols, schema
             )
             if cat and amount and workspace.dataset:
-                df = load_dataset(workspace.dataset)
-                id_col = self._resolve_column(cols, ("order_id", "id")) or amount
-                dual = (
-                    df.groupby(cat, as_index=False)
-                    .agg(**{"revenue": (amount, "sum"), "orders": (id_col, "count")})
-                    .to_dict(orient="records")
-                )
-                return {
-                    "chart_type": "dual_axis",
-                    "title": out.get("title") or f"Revenue and order count by {cat}",
-                    "data_records": dual,
-                    "x": cat,
-                    "y": "revenue",
-                    "y2": "orders",
-                }
+                rebuilt = self._dual_axis_spec(cols, schema, workspace, cat, amount)
+                if rebuilt:
+                    rebuilt["title"] = out.get("title") or rebuilt["title"]
+                    return rebuilt
 
         # Already has concrete records — keep if plottable (dual_axis / bar from analysis)
         if out.get("data_records"):
@@ -616,11 +729,11 @@ class VisualizationAgent:
             if out.get("metric_column") and not agg.get("metric_column"):
                 agg["metric_column"] = out["metric_column"]
 
-            group_by = self._map_column(agg.get("group_by"), cols, _CATEGORY_HINTS) or self._resolve_column(
-                cols, _CATEGORY_HINTS
+            group_by = self._map_column(agg.get("group_by"), cols, _CATEGORY_ALIASES) or self._default_category(
+                cols, schema
             )
-            metric = self._map_column(agg.get("metric_column"), cols, _AMOUNT_HINTS) or self._resolve_column(
-                cols, _AMOUNT_HINTS
+            metric = self._map_column(agg.get("metric_column"), cols, _AMOUNT_ALIASES) or self._default_metric(
+                cols, schema
             )
             if not metric:
                 return None
@@ -635,10 +748,14 @@ class VisualizationAgent:
             return out
 
         # Raw / histogram path
-        x = self._map_column(out.get("x"), cols, _AMOUNT_HINTS if chart_type == "histogram" else _CATEGORY_HINTS)
-        y = self._map_column(out.get("y"), cols, _AMOUNT_HINTS)
+        x = self._map_column(
+            out.get("x"),
+            cols,
+            _AMOUNT_ALIASES if chart_type == "histogram" else _CATEGORY_ALIASES,
+        )
+        y = self._map_column(out.get("y"), cols, _AMOUNT_ALIASES)
         if chart_type == "histogram":
-            x = x or self._resolve_column(cols, _AMOUNT_HINTS)
+            x = x or self._default_metric(cols, schema)
             if not x:
                 return None
             out["x"] = x
@@ -654,13 +771,13 @@ class VisualizationAgent:
             out["use_raw_dataset"] = True
             return out
 
-        # Last resort: build aggregation from schema
-        cat = self._resolve_column(cols, _CATEGORY_HINTS)
-        amount = self._resolve_column(cols, _AMOUNT_HINTS)
+        # Last resort: build aggregation from schema dtypes
+        cat = self._default_category(cols, schema)
+        amount = self._default_metric(cols, schema)
         if cat and amount:
             return {
                 "chart_type": "bar",
-                "title": out.get("title") or "Revenue by Product Category",
+                "title": out.get("title") or f"{amount} by {cat}",
                 "aggregation": {"group_by": cat, "metric_column": amount, "agg": "sum"},
                 "x": cat,
                 "y": "value",
@@ -669,16 +786,7 @@ class VisualizationAgent:
 
     @staticmethod
     def _resolve_column(cols: list[str], hints: tuple[str, ...]) -> str | None:
-        lower_map = {c.lower(): c for c in cols}
-        for hint in hints:
-            if hint.lower() in lower_map:
-                return lower_map[hint.lower()]
-        for c in cols:
-            cl = c.lower()
-            for hint in hints:
-                if hint.lower() in cl:
-                    return c
-        return None
+        return match_column(cols, *hints)
 
     @classmethod
     def _map_column(
@@ -695,12 +803,33 @@ class VisualizationAgent:
             return name
         if name.lower() in lower_map:
             return lower_map[name.lower()]
-        # Map aliases like "revenue" → total_amount
-        alias_hints = (name.lower(),) + hints
-        return cls._resolve_column(cols, alias_hints)
+        # Map aliases like "revenue" onto a matching schema column name
+        return match_column(cols, name, *hints)
 
     def _render_one(self, spec: dict[str, Any], workspace: SharedWorkspace) -> dict[str, Any]:
         chart_type = self._normalize_chart_type_name(spec.get("chart_type"))
+
+        if chart_type == "forecast":
+            forecast = spec.get("forecast")
+            if forecast is None and spec.get("forecast_id"):
+                forecast = next(
+                    (
+                        f
+                        for f in (workspace.forecasts or [])
+                        if f.get("id") == spec.get("forecast_id")
+                    ),
+                    None,
+                )
+            if forecast is None:
+                suitable = [f for f in (workspace.forecasts or []) if f.get("suitable")]
+                forecast = suitable[-1] if suitable else None
+            if not forecast:
+                raise ValueError("Forecast chart requires a suitable forecast artifact in the workspace.")
+            return chart_tools.render_forecast_chart(
+                forecast,
+                title=spec.get("title"),
+                dataset_meta=workspace.dataset,
+            )
 
         # Heatmap / box always need the full dataset — ignore any data_records.
         if chart_type in {"heatmap", "box"} or spec.get("use_raw_dataset"):

@@ -6,6 +6,13 @@ from typing import Any
 
 from app.llm import LLMClient
 from app.messages import AgentMessage, AgentResult
+from app.schema_utils import (
+    default_group_column,
+    default_id_column,
+    default_metric_column,
+    default_time_column,
+    match_column,
+)
 from app.state import SharedWorkspace
 from app.tools import eda_tools, query_tools
 
@@ -25,11 +32,7 @@ class AnalysisAgent:
             if action in {"correlate", "explore", "eda"}:
                 return self._eda(message, workspace, action=action)
             if action in {"answer_question", "analyze", "run_query"}:
-                question = (
-                    message.parameters.get("question")
-                    or message.parameters.get("user_request")
-                    or ""
-                )
+                question = self._resolve_question(message)
                 # Pure EDA questions (and not multi-summary) → eda tools
                 if self._wants_eda(question) and not self._wants_multi_summary(question):
                     return self._eda(message, workspace, action="explore")
@@ -98,9 +101,16 @@ class AnalysisAgent:
         question = message.parameters.get("question") or message.parameters.get("user_request") or ""
         schema = workspace.dataset.get("schema", {})
         cols = list(schema.keys())
-        metric = self._pick(cols, ["total_amount", "revenue", "amount", "unit_price", "value"]) or cols[-1]
-        group = self._pick(cols, ["product_category", "category", "state"])
-        id_col = self._pick(cols, ["customer_id", "order_id", "id"]) or metric
+        metric = (
+            match_column(cols, "revenue", "amount", "sales", "value", "price", "total")
+            or default_metric_column(schema, cols)
+            or cols[-1]
+        )
+        group = (
+            match_column(cols, "category", "segment", "type", "group", "region", "state")
+            or default_group_column(schema, cols)
+        )
+        id_col = default_id_column(schema, cols) or metric
 
         plans = [
             ("std", metric, "spread of values (std)"),
@@ -249,8 +259,25 @@ class AnalysisAgent:
         return grounded
 
 
+    @staticmethod
+    def _resolve_question(message: AgentMessage) -> str:
+        """Prefer explicit question; enrich with short-term conversation context when present."""
+        question = (
+            message.parameters.get("question")
+            or message.parameters.get("user_request")
+            or ""
+        )
+        prompt = (message.context or {}).get("conversation_prompt") or ""
+        if not prompt or "empty" in prompt.lower():
+            return question
+        return (
+            f"{question}\n\n"
+            f"(Interpret follow-ups using this short-term context; "
+            f"do not invent numbers.)\n{prompt}"
+        )
+
     def _analyze(self, message: AgentMessage, workspace: SharedWorkspace) -> AgentResult:
-        question = message.parameters.get("question") or message.parameters.get("user_request") or ""
+        question = self._resolve_question(message)
         schema = workspace.dataset.get("schema", {})
         plan = message.parameters.get("query_plan") or self._plan_query(question, schema)
 
@@ -309,17 +336,24 @@ class AnalysisAgent:
         if out.get("_offline") or out.get("_fallback") or (
             out.get("mode") not in {"sql", "aggregation"} and "sql" not in out and "metric_column" not in out
         ):
-            return self._heuristic_plan(question, cols)
+            return self._heuristic_plan(question, cols, schema)
         if out.get("sql") and not out.get("mode"):
             out["mode"] = "sql"
         if out.get("metric_column") and not out.get("mode"):
             out["mode"] = "aggregation"
         return out
 
-    def _heuristic_plan(self, question: str, cols: list[str]) -> dict[str, Any]:
+    def _heuristic_plan(self, question: str, cols: list[str], schema: dict[str, Any]) -> dict[str, Any]:
         q = question.lower()
-        metric = self._pick(cols, ["total_amount", "revenue", "amount", "unit_price", "value"]) or cols[-1]
-        group = self._pick(cols, ["product_category", "category", "state"])
+        metric = (
+            match_column(cols, "revenue", "amount", "sales", "value", "price", "total")
+            or default_metric_column(schema, cols)
+            or (cols[-1] if cols else None)
+        )
+        group = (
+            match_column(cols, "category", "segment", "type", "group", "region", "state")
+            or default_group_column(schema, cols)
+        )
 
         if any(k in q for k in ("percent", "percentage", "share of", "pct", "% of", "share")):
             return {
@@ -331,7 +365,7 @@ class AnalysisAgent:
                 "limit": 20,
             }
         if any(k in q for k in ("unique", "distinct", "how many different", "nunique")):
-            id_col = self._pick(cols, ["customer_id", "order_id", "id"]) or metric
+            id_col = default_id_column(schema, cols) or metric
             return {
                 "mode": "aggregation",
                 "group_by": group,
@@ -349,8 +383,9 @@ class AnalysisAgent:
                 "order_desc": True,
                 "limit": 20,
             }
-        if "categor" in q and ("revenue" in q or "most" in q or "generate" in q):
-            group = self._pick(cols, ["product_category", "category"])
+        if ("categor" in q or "group" in q or "by " in q) and (
+            "revenue" in q or "most" in q or "generate" in q or "sum" in q or "total" in q
+        ):
             return {
                 "mode": "aggregation",
                 "group_by": group,
@@ -359,14 +394,11 @@ class AnalysisAgent:
                 "order_desc": True,
                 "limit": 20,
             }
-        if "state" in q and ("customer" in q or "most" in q or "how many" in q):
-            group = self._pick(cols, ["state"])
-            return {"mode": "aggregation", "group_by": group, "metric_column": metric, "agg": "count", "order_desc": True}
         if "average" in q or "avg" in q or "mean" in q:
             return {"mode": "aggregation", "group_by": None, "metric_column": metric, "agg": "mean"}
         if "over time" in q or "trend" in q:
-            date_col = self._pick(cols, ["order_date", "date", "timestamp"])
-            if date_col:
+            date_col = default_time_column(schema, cols)
+            if date_col and metric:
                 return {
                     "mode": "sql",
                     "sql": (
@@ -374,8 +406,6 @@ class AnalysisAgent:
                         f"SUM({metric}) AS value FROM data GROUP BY 1 ORDER BY 1"
                     ),
                 }
-        # default: top categories by metric if available
-        group = self._pick(cols, ["product_category", "category", "state"])
         return {
             "mode": "aggregation",
             "group_by": group,
@@ -386,19 +416,8 @@ class AnalysisAgent:
         }
 
     def _default_metric(self, schema: dict[str, Any]) -> str:
-        return self._pick(list(schema.keys()), ["total_amount", "amount", "value", "unit_price"]) or list(schema.keys())[0]
-
-    @staticmethod
-    def _pick(cols: list[str], candidates: list[str]) -> str | None:
-        lower_map = {c.lower(): c for c in cols}
-        for cand in candidates:
-            if cand.lower() in lower_map:
-                return lower_map[cand.lower()]
-        for c in cols:
-            for cand in candidates:
-                if cand.lower() in c.lower():
-                    return c
-        return None
+        cols = list(schema.keys())
+        return default_metric_column(schema, cols) or cols[0]
 
     def _explain(self, question: str, result: dict[str, Any], schema: dict[str, Any]) -> str:
         records = result.get("records") or []

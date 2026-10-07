@@ -12,7 +12,9 @@ AgentName = Literal[
     "dataset_agent",
     "analysis_agent",
     "anomaly_agent",
+    "forecasting_agent",
     "visualization_agent",
+    "drafting_agent",
     "validation_agent",
 ]
 

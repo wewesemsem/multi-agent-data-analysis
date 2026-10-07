@@ -12,13 +12,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Static fallbacks used when a provider API is unreachable.
+# Static fallbacks used when a provider API is unreachable (latest 3 chat models).
 PROVIDERS: dict[str, dict[str, Any]] = {
     "openai": {
         "label": "OpenAI",
         "env_key": "OPENAI_API_KEY",
         "default_model": "gpt-4o-mini",
-        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini"],
+        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
     },
     "anthropic": {
         "label": "Claude (Anthropic)",
@@ -30,15 +30,54 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "label": "Gemini (Google)",
         "env_key": "GOOGLE_API_KEY",
         "default_model": "gemini-flash-latest",
-        "models": ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro"],
+        "models": ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-flash"],
         # OpenAI-compatible Gemini endpoint
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
     },
 }
 
 DEFAULT_PROVIDER = "openai"
+MAX_MODEL_CHOICES = 3
 _MODEL_CACHE_TTL_SEC = 3600.0
 _model_cache: dict[str, tuple[float, list[str]]] = {}
+
+# CI / local tests may set this to keep keyword planning without an API key.
+# Live demos must leave this unset so missing keys and API failures fail loudly.
+_OFFLINE_ENV = "MAS_ALLOW_OFFLINE_HEURISTICS"
+
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when the LLM cannot be used (missing key or API failure)."""
+
+
+def offline_heuristics_allowed() -> bool:
+    return os.getenv(_OFFLINE_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def supports_custom_temperature(model: str | None) -> bool:
+    """Newer reasoning / GPT-5-class models only accept the API default temperature."""
+    name = (model or "").lower()
+    if not name:
+        return True
+    # OpenAI reasoning + GPT-5 family (and preview aliases) reject temperature != default.
+    blocked_prefixes = (
+        "o1",
+        "o3",
+        "o4",
+        "gpt-5",
+        "gpt5",
+    )
+    if any(name.startswith(p) or f"-{p}" in name or f"/{p}" in name for p in blocked_prefixes):
+        return False
+    return True
+
+
+def _is_temperature_unsupported_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "temperature" in text and (
+        "unsupported" in text or "does not support" in text or "unsupported_value" in text
+    )
+
 
 # Non-chat / specialty model markers shared across providers.
 _EXCLUDE_SUBSTRINGS = (
@@ -66,6 +105,11 @@ _EXCLUDE_SUBSTRINGS = (
     "babbage",
     "ada-",
     "curie",
+    "sora",
+    "omni-moderation",
+    "text-similarity",
+    "text-search",
+    "code-search",
 )
 
 
@@ -120,6 +164,7 @@ def api_key_for(provider: str) -> str | None:
 
 
 def _is_chat_model(model_id: str) -> bool:
+    """True only for text chat / completion models usable via chat APIs."""
     mid = model_id.lower().removeprefix("models/")
     if any(token in mid for token in _EXCLUDE_SUBSTRINGS):
         return False
@@ -129,8 +174,14 @@ def _is_chat_model(model_id: str) -> bool:
             return False
         return True
     if mid.startswith("claude-"):
+        # Skip Claude specialty / non-Messages API ids if they appear.
+        if any(token in mid for token in ("-tools", "-citadel")):
+            return False
         return True
     if mid.startswith("gemini-") or mid.startswith("gemma-"):
+        # Chat-capable Gemini only (exclude Imagen/Veo-style ids already covered above).
+        if any(token in mid for token in ("imagen", "tts", "embedding")):
+            return False
         return True
     return False
 
@@ -227,7 +278,7 @@ def _drop_dated_when_alias_exists(model_ids: list[str]) -> list[str]:
 
 
 def list_models(provider: str | None = None, *, force_refresh: bool = False) -> list[str]:
-    """Return chat-capable models for a provider, newest-first. Falls back to static catalog."""
+    """Return the latest chat-capable models for a provider (max 3), newest-first."""
     provider = resolve_provider(provider)
     now = time.time()
     if not force_refresh and provider in _model_cache:
@@ -257,6 +308,11 @@ def list_models(provider: str | None = None, *, force_refresh: bool = False) -> 
 
     if not models:
         models = _fallback_models(provider)
+
+    # Defense in depth: re-filter chat-only, then keep the newest three.
+    models = [m for m in models if _is_chat_model(m)][:MAX_MODEL_CHOICES]
+    if not models:
+        models = _fallback_models(provider)[:MAX_MODEL_CHOICES]
 
     _model_cache[provider] = (now + _MODEL_CACHE_TTL_SEC, list(models))
     return list(models)
@@ -293,7 +349,7 @@ def default_model_for(provider: str) -> str:
 
 
 class LLMClient:
-    """Multi-provider chat client with a deterministic offline fallback for MVP demos."""
+    """Multi-provider chat client. Missing keys / API failures raise unless offline heuristics are allowed."""
 
     def __init__(
         self,
@@ -352,13 +408,15 @@ class LLMClient:
         label = PROVIDERS[self.provider]["label"]
         if self._client is None:
             env_key = PROVIDERS[self.provider]["env_key"]
-            return f"offline heuristics (no {env_key})"
+            if offline_heuristics_allowed():
+                return f"offline heuristics allowed (no {env_key})"
+            return f"LLM unavailable — set {env_key}"
         if self.last_error:
             return f"{label} key set, last call failed: {self.last_error[:80]}"
         return f"{label} · {self.model}"
 
     def chat_json(self, system: str, user: str, *, temperature: float = 0.1) -> dict[str, Any]:
-        """Ask the LLM for a JSON object. Falls back to heuristic parsing when offline."""
+        """Ask the LLM for a JSON object. Raises LLMUnavailableError when the model cannot be used."""
         if self._client is not None:
             try:
                 content = self._complete(system, user, temperature=temperature, json_mode=True)
@@ -367,10 +425,20 @@ class LLMClient:
                 if parsed is not None:
                     return parsed
                 return json.loads(content or "{}")
-            except Exception as exc:  # noqa: BLE001 — MVP: fall through to offline mode
+            except LLMUnavailableError:
+                raise
+            except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
-                return {"_llm_error": str(exc), "_fallback": True}
-        return {"_offline": True}
+                if offline_heuristics_allowed():
+                    return {"_llm_error": str(exc), "_fallback": True}
+                raise LLMUnavailableError(f"LLM call failed: {exc}") from exc
+        if offline_heuristics_allowed():
+            return {"_offline": True}
+        env_key = PROVIDERS[self.provider]["env_key"]
+        raise LLMUnavailableError(
+            f"No API key for {PROVIDERS[self.provider]['label']}. "
+            f"Set {env_key} in .env (offline heuristics are disabled for live use)."
+        )
 
     def chat_text(self, system: str, user: str, *, temperature: float = 0.2) -> str:
         if self._client is not None:
@@ -378,10 +446,20 @@ class LLMClient:
                 text = self._complete(system, user, temperature=temperature, json_mode=False)
                 self.last_error = None
                 return (text or "").strip()
+            except LLMUnavailableError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
-                return f"(LLM unavailable: {exc})"
-        return ""
+                if offline_heuristics_allowed():
+                    return f"(LLM unavailable: {exc})"
+                raise LLMUnavailableError(f"LLM call failed: {exc}") from exc
+        if offline_heuristics_allowed():
+            return ""
+        env_key = PROVIDERS[self.provider]["env_key"]
+        raise LLMUnavailableError(
+            f"No API key for {PROVIDERS[self.provider]['label']}. "
+            f"Set {env_key} in .env (offline heuristics are disabled for live use)."
+        )
 
     def _complete(
         self,
@@ -405,16 +483,27 @@ class LLMClient:
     ) -> str:
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
+        # Never send temperature on the OpenAI-compatible path (OpenAI + Gemini).
+        # GPT-5 / o-series reject any value other than the API default.
         # Gemini's OpenAI-compat endpoint supports json_object; keep it for both.
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        resp = self._client.chat.completions.create(**kwargs)
+        try:
+            resp = self._client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            # Some models reject json_object — retry without it.
+            if json_mode and "response_format" in kwargs and (
+                "response_format" in str(exc).lower() or "json_object" in str(exc).lower()
+            ):
+                kwargs.pop("response_format", None)
+                resp = self._client.chat.completions.create(**kwargs)
+            else:
+                raise
         return resp.choices[0].message.content or ("{}" if json_mode else "")
 
     def _complete_anthropic(
@@ -433,10 +522,10 @@ class LLMClient:
                 "Respond with a single valid JSON object only. "
                 "No markdown fences, no commentary."
             )
+        # anthropic>=1.x Messages.create no longer accepts temperature; omit it.
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=4096,
-            temperature=temperature,
             system=sys,
             messages=[{"role": "user", "content": usr}],
         )

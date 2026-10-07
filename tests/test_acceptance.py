@@ -1,7 +1,7 @@
 """Acceptance and unit tests for the multi-agent MVP.
 
-Tools are tested with real computation. Orchestrator acceptance runs offline
-(heuristic planning) so CI does not require an API key.
+Tools are tested with real computation. Orchestrator acceptance uses
+MAS_ALLOW_OFFLINE_HEURISTICS (set in conftest) so CI does not require an API key.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def test_query_aggregation_grounded():
 
 
 def test_anomaly_iqr_grounded():
-    meta = dataset_tools.create_ecommerce_orders(n_rows=2000, seed=2)
+    meta = dataset_tools.create_ecommerce_orders(n_rows=2000, seed=2, inject_outliers=True)
     result = anomaly_tools.detect_anomalies(meta, column="total_amount", method="iqr")
     assert result["grounded"] is True
     assert result["method"] == "iqr"
@@ -55,7 +55,7 @@ def test_anomaly_iqr_grounded():
 def test_anomaly_method_alias_statistical():
     """LLM planners often pass method='statistical'; map it instead of failing."""
     assert anomaly_tools.normalize_method("statistical") == "auto"
-    meta = dataset_tools.create_ecommerce_orders(n_rows=500, seed=4)
+    meta = dataset_tools.create_ecommerce_orders(n_rows=500, seed=4, inject_outliers=True)
     result = anomaly_tools.detect_anomalies(meta, column="total_amount", method="statistical")
     assert result["grounded"] is True
     assert result["method"] in {"iqr", "zscore"}

@@ -62,9 +62,8 @@ def detect_anomalies(
         raise ValueError("No numeric columns available for anomaly detection.")
 
     if column is None:
-        # Prefer amount-like columns
-        preferred = [c for c in numeric_cols if any(k in c.lower() for k in ("amount", "price", "total", "value", "revenue"))]
-        column = preferred[0] if preferred else numeric_cols[0]
+        # Use the first numeric column — no domain-specific preference.
+        column = numeric_cols[0]
     if column not in df.columns:
         raise ValueError(f"Column '{column}' not found.")
     if column not in numeric_cols:

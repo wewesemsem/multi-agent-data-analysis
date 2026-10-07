@@ -19,17 +19,17 @@ from app.agents.dataset_agent import DatasetAgent
 from app.llm import (
     DEFAULT_PROVIDER,
     LLMClient,
+    MAX_MODEL_CHOICES,
     PROVIDERS,
     clear_model_cache,
     latest_model_for,
     list_models,
     resolve_provider,
 )
+from app.context import ConversationContext
 from app.messages import AgentMessage
 from app.orchestrator import Orchestrator
 from app.state import SharedWorkspace, ensure_workspace
-from app.tools import chart_tools, dataset_tools, eda_tools, query_tools
-
 st.set_page_config(
     page_title="Data Intelligence MAS",
     page_icon=str(ROOT / ".streamlit" / "favicon.ico"),
@@ -44,69 +44,77 @@ STEP_EXAMPLES = [
     ("Create 10k e-commerce orders", "Create a dataset of 10,000 fictional e-commerce orders."),
     ("Revenue by category", "How much revenue does each product category generate?"),
     ("Find anomalies", "Find anomalous transactions."),
+    ("Forecast revenue", "Forecast revenue for the next 12 months."),
     ("Visualize revenue by category", "Show me a visualization of revenue by category."),
+    (
+        "Draft a report",
+        "Write a detailed report summarizing the analysis, anomalies, and forecast.",
+    ),
 ]
 
-# Alternative: one-shot instead of steps 1–4
+# Alternative: one-shot instead of steps 1–6
 FULL_WORKFLOW_EXAMPLE = (
     "Full acceptance workflow",
     (
         "Create a synthetic e-commerce dataset with 10,000 orders. "
         "Tell me which product categories generate the most revenue, "
-        "identify anomalous transactions, and create visualizations showing "
-        "revenue by category and the distribution of transaction amounts."
+        "identify anomalous transactions, forecast revenue for the next 12 months, "
+        "create visualizations showing revenue by category and the distribution of "
+        "transaction amounts, and draft a report summarizing the findings."
     ),
 )
 
-# Natural-language demos — routed through the orchestrator to real agents
-TIER0_DEMOS = [
-    {
-        "key": "eda",
-        "title": "Explore the data",
-        "plain": "Links between columns, blank values, and typical ranges",
-        "jargon": "EDA · correlation · missingness · quantiles",
-        "agents": "Analysis Agent · Dataset Agent",
-        "prompt": (
-            "Explore the data — show how columns relate, missing values, and typical ranges."
+# Second stepped demo — same pattern as STEP_EXAMPLES, but on a generic (non-ecommerce) dataset.
+TOOLKIT_STEP_EXAMPLES = [
+    (
+        "Create a generic synthetic dataset",
+        (
+            "Create a generic synthetic dataset with 5,000 rows "
+            "(not e-commerce — use template=generic)."
         ),
-    },
-    {
-        "key": "aggs",
-        "title": "Summarize by category",
-        "plain": "Spread, unique customers, and percent of revenue",
-        "jargon": "Aggs · std · nunique · pct",
-        "agents": "Analysis Agent",
-        "prompt": (
-            "For each product category, show the spread of order totals, "
-            "how many unique customers, and each category's percent share of revenue."
+        "Load generic tabular data · Dataset Agent",
+    ),
+    (
+        "Explore the data",
+        "Explore the data — show how columns relate, missing values, and typical ranges.",
+        "Links between columns, blank values, and typical ranges · "
+        "EDA · correlation · missingness · quantiles → Analysis · Dataset",
+    ),
+    (
+        "Summarize by category",
+        (
+            "For each category, show the spread of values, "
+            "how many unique ids, and each category's percent share of total value."
         ),
-    },
-    {
-        "key": "charts",
-        "title": "Show box, heat, and dual charts",
-        "plain": "Three chart styles for the same dataset",
-        "jargon": "Charts · box · heatmap · dual_axis",
-        "agents": "Visualization Agent",
-        "prompt": (
-            "Create a box plot of order amounts by category, a heatmap of how numeric "
-            "columns relate, and a dual-axis chart of revenue and order count by category."
+        "Spread, unique counts, and percent of total · "
+        "Aggs · std · nunique · pct → Analysis Agent",
+    ),
+    (
+        "Show box, heat, and dual charts",
+        (
+            "Create a box plot of values by category, a heatmap of how numeric "
+            "columns relate, and a dual-axis chart of total value and row count by category."
         ),
-    },
-    {
-        "key": "all",
-        "title": "Run all of the above",
-        "plain": "Exploration, summaries, and new charts in one go",
-        "jargon": "EDA + Aggs + Charts",
-        "agents": "Dataset · Analysis · Visualization",
-        "prompt": (
-            "Explore the data — show how columns relate, missing values, and typical ranges. "
-            "For each product category, show the spread of order totals, how many unique customers, "
-            "and each category's percent share of revenue. "
-            "Create a box plot of order amounts by category, a heatmap of how numeric columns relate, "
-            "and a dual-axis chart of revenue and order count by category."
-        ),
-    },
+        "Three chart styles for the same dataset · "
+        "Charts · box · heatmap · dual_axis → Visualization Agent",
+    ),
 ]
+
+# One-shot for the toolkit demo (always creates a generic dataset first).
+TOOLKIT_FULL_EXAMPLE = (
+    "Run all of the above",
+    (
+        "Create a generic synthetic dataset with 5,000 rows "
+        "(not e-commerce — use template=generic). "
+        "Explore the data — show how columns relate, missing values, and typical ranges. "
+        "For each category, show the spread of values, how many unique ids, "
+        "and each category's percent share of total value. "
+        "Create a box plot of values by category, a heatmap of how numeric columns relate, "
+        "and a dual-axis chart of total value and row count by category."
+    ),
+    "Exploration, summaries, and new charts in one go · "
+    "EDA + Aggs + Charts → Dataset · Analysis · Visualization",
+)
 
 CUSTOM_CSS = """
 <style>
@@ -209,6 +217,30 @@ CUSTOM_CSS = """
         color: #8aa399;
         margin: 0.35rem 0 0.15rem 0;
         font-weight: 600;
+    }
+    .msg-greeting-wave {
+        display: inline-flex;
+        vertical-align: -0.2em;
+        margin-right: 0.4rem;
+        width: 1.15rem;
+        height: 1.15rem;
+        color: #8fd4a8;
+        transform-origin: 70% 90%;
+        animation: wave-hand 1.6s ease-in-out 3;
+    }
+    .msg-greeting-wave svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+    }
+    @keyframes wave-hand {
+        0%   { transform: rotate(0deg); }
+        12%  { transform: rotate(16deg); }
+        24%  { transform: rotate(-10deg); }
+        36%  { transform: rotate(16deg); }
+        48%  { transform: rotate(-6deg); }
+        60%  { transform: rotate(10deg); }
+        72%, 100% { transform: rotate(0deg); }
     }
     .example-arrow {
         text-align: center;
@@ -361,7 +393,7 @@ TOUR_STEPS = [
     },
     {
         "tab": "Anomalies",
-        "pointer": "54%",
+        "pointer": "48%",
         "title": "Anomalies",
         "agent": "Anomaly Detection Agent",
         "body": (
@@ -371,8 +403,19 @@ TOUR_STEPS = [
         ),
     },
     {
+        "tab": "Forecasts",
+        "pointer": "55%",
+        "title": "Forecasts",
+        "agent": "Forecasting Agent",
+        "body": (
+            "Quantitative forecasts from historical time series. The agent inspects the dataset, "
+            "compares methods on a holdout window, and tools compute future values — "
+            "the LLM only explains the grounded forecast artifact."
+        ),
+    },
+    {
         "tab": "Charts",
-        "pointer": "70%",
+        "pointer": "66%",
         "title": "Charts",
         "agent": "Visualization Agent",
         "body": (
@@ -381,8 +424,19 @@ TOUR_STEPS = [
         ),
     },
     {
+        "tab": "Drafts",
+        "pointer": "78%",
+        "title": "Drafts",
+        "agent": "Drafting Agent",
+        "body": (
+            "Reports, summaries, memos, and creditworthiness assessments synthesized from "
+            "validated specialist outputs. The Drafting Agent does not recalculate metrics — "
+            "it organizes evidence, interpretation, recommendations, and limitations."
+        ),
+    },
+    {
         "tab": "Agent log",
-        "pointer": "88%",
+        "pointer": "90%",
         "title": "Agent log",
         "agent": "Validation / Critic + full history",
         "body": (
@@ -396,6 +450,7 @@ TOUR_STEPS = [
 def _fresh_state() -> dict:
     return {
         "workspace": SharedWorkspace(),
+        "conversation_context": ConversationContext(),
         "events": [],
         "messages": [],
         "busy": False,
@@ -408,6 +463,7 @@ def _fresh_state() -> dict:
 # Only app-owned keys — never delete Streamlit widget keys in the same click handler.
 _APP_KEYS = (
     "workspace",
+    "conversation_context",
     "events",
     "messages",
     "busy",
@@ -431,117 +487,12 @@ def hard_reset_session() -> None:
     for key in _APP_KEYS:
         st.session_state.pop(key, None)
     st.session_state.workspace = fresh["workspace"]
+    st.session_state.conversation_context = fresh["conversation_context"]
     st.session_state.events = fresh["events"]
     st.session_state.messages = fresh["messages"]
     st.session_state.busy = False
     st.session_state.toolkit_demos = fresh["toolkit_demos"]
     st.session_state.flash = "Workspace reset — conversation and results cleared."
-
-
-def _ensure_demo_dataset(ws: SharedWorkspace) -> dict:
-    """Use the active dataset, or create a small synthetic one for demos."""
-    if ws.dataset:
-        return ws.dataset
-    meta = dataset_tools.create_ecommerce_orders(n_rows=1_500, seed=42, name="tier0_demo_orders")
-    ws.dataset = meta
-    return meta
-
-
-def run_tier0_eda_demo(ws: SharedWorkspace) -> dict:
-    meta = _ensure_demo_dataset(ws)
-    corr = eda_tools.correlation_matrix(
-        meta,
-        columns=["quantity", "unit_price", "total_amount"],
-    )
-    missing = eda_tools.missingness_summary(meta)
-    quantiles = eda_tools.quantile_stats(meta, columns=["total_amount", "unit_price", "quantity"])
-    return {"correlation": corr, "missingness": missing, "quantiles": quantiles}
-
-
-def run_tier0_aggs_demo(ws: SharedWorkspace) -> dict:
-    meta = _ensure_demo_dataset(ws)
-    return {
-        "std": query_tools.execute_aggregation(
-            meta, group_by="product_category", metric_column="total_amount", agg="std"
-        ),
-        "nunique": query_tools.execute_aggregation(
-            meta, group_by="product_category", metric_column="customer_id", agg="nunique"
-        ),
-        "pct": query_tools.execute_aggregation(
-            meta, group_by="product_category", metric_column="total_amount", agg="pct"
-        ),
-    }
-
-
-def run_tier0_charts_demo(ws: SharedWorkspace) -> list[dict]:
-    meta = _ensure_demo_dataset(ws)
-    df = dataset_tools.load_dataset(meta)
-    dual_records = (
-        df.groupby("product_category", as_index=False)
-        .agg(revenue=("total_amount", "sum"), orders=("order_id", "count"))
-        .to_dict(orient="records")
-    )
-    # Replace prior Tier 0 demo charts so re-runs don't stack duplicates
-    ws.visualizations = [
-        v for v in ws.visualizations if not str(v.get("title") or "").startswith("Tier 0 ·")
-    ]
-    charts = [
-        chart_tools.render_chart(
-            chart_type="box",
-            title="Tier 0 · Order amounts by category (box chart)",
-            dataset_meta=meta,
-            x="product_category",
-            y="total_amount",
-        ),
-        chart_tools.render_chart(
-            chart_type="heatmap",
-            title="Tier 0 · How numeric columns relate (heat map)",
-            dataset_meta=meta,
-        ),
-        chart_tools.render_chart(
-            chart_type="dual_axis",
-            title="Tier 0 · Revenue and order count together",
-            data_records=dual_records,
-            x="product_category",
-            y="revenue",
-            y2="orders",
-        ),
-    ]
-    # Surface in Charts tab as well
-    for chart in charts:
-        ws.visualizations.append(chart)
-    return charts
-
-
-def run_tier0_demo(kind: str) -> None:
-    """Execute Tier 0 tool demos and stash results for the Toolkit tab."""
-    ws: SharedWorkspace = st.session_state.workspace
-    demos = dict(st.session_state.get("toolkit_demos") or {})
-    spinner_labels = {
-        "eda": "exploring the data",
-        "aggs": "summarizing by category",
-        "charts": "building charts",
-        "all": "running all demos",
-    }
-    with st.spinner(f"Running demo: {spinner_labels.get(kind, kind)}…"):
-        if kind in {"eda", "all"}:
-            demos["eda"] = run_tier0_eda_demo(ws)
-        if kind in {"aggs", "all"}:
-            demos["aggs"] = run_tier0_aggs_demo(ws)
-        if kind in {"charts", "all"}:
-            demos["charts"] = run_tier0_charts_demo(ws)
-    st.session_state.toolkit_demos = demos
-    st.session_state.workspace = ws
-    labels = {
-        "eda": "data exploration",
-        "aggs": "category summaries",
-        "charts": "new chart types",
-        "all": "all toolkit demos",
-    }
-    st.session_state.flash = (
-        f"Demo ready — {labels.get(kind, kind)}. Open the **Toolkit** tab "
-        "(and **Charts** for the new visuals)."
-    )
 
 
 def apply_reset_if_requested() -> bool:
@@ -579,7 +530,7 @@ def render_header(ws: SharedWorkspace) -> None:
             <div class="mas-banner">
               <h1>Data Intelligence</h1>
               <p>Multi-agent workspace — orchestrator delegates to dataset, analysis,
-              anomaly, visualization, and validation agents. Numbers come from tools, not the LLM.</p>
+              anomaly, forecasting, visualization, and validation agents. Numbers come from tools, not the LLM.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -595,11 +546,13 @@ def render_header(ws: SharedWorkspace) -> None:
             help="Clear conversation, dataset, analyses, anomalies, charts, and agent log",
         )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Status", ws.task_status)
     c2.metric("Dataset rows", (ws.dataset or {}).get("row_count") or 0)
     c3.metric("Analyses", len(ws.analysis_results))
-    c4.metric("Charts", len(ws.visualizations))
+    c4.metric("Forecasts", len(ws.forecasts))
+    c5.metric("Charts", len(ws.visualizations))
+    c6.metric("Drafts", len(getattr(ws, "drafts", None) or []))
 
 
 def render_progress(events: list[dict]) -> None:
@@ -732,11 +685,54 @@ def render_anomaly_panel(ws: SharedWorkspace) -> None:
             st.json(item.get("parameters") or {})
 
 
+def render_forecast_panel(ws: SharedWorkspace) -> None:
+    if not ws.forecasts:
+        st.info("No forecasts yet.")
+        return
+    for i, item in enumerate(ws.forecasts, 1):
+        st.markdown(f"#### Forecast run {i}")
+        if not item.get("suitable"):
+            st.warning(item.get("explanation") or item.get("reason") or "Forecast not suitable.")
+            reqs = item.get("requirements") or []
+            if reqs:
+                st.markdown("**What to provide**")
+                for req in reqs:
+                    st.markdown(f"- {req}")
+            continue
+        st.markdown(
+            f"Target **`{item.get('target_column')}`** · "
+            f"time `{item.get('time_column')}` · "
+            f"frequency **{item.get('frequency')}** · "
+            f"horizon **{item.get('forecast_horizon')}** · "
+            f"method **`{item.get('selected_method')}`**"
+        )
+        st.markdown(item.get("explanation") or "")
+        values = item.get("forecast_values") or []
+        if values:
+            st.dataframe(values, use_container_width=True)
+        metrics = item.get("evaluation_metrics") or []
+        if metrics:
+            with st.expander("Holdout evaluation"):
+                st.dataframe(metrics, use_container_width=True)
+                st.caption(f"Baseline: {item.get('baseline_metrics')}")
+        with st.expander("Assumptions / warnings"):
+            st.json(
+                {
+                    "assumptions": item.get("assumptions"),
+                    "warnings": item.get("warnings"),
+                    "seasonality": item.get("seasonality"),
+                    "trend": item.get("trend"),
+                    "validation": item.get("validation"),
+                }
+            )
+
+
 def render_charts_panel(ws: SharedWorkspace) -> None:
     if not ws.visualizations:
         st.info("No visualizations yet.")
         return
-    for i, viz in enumerate(ws.visualizations):
+    # Newest charts first (workspace appends in creation order).
+    for i, viz in enumerate(reversed(ws.visualizations)):
         chart_id = viz.get("id") or f"idx_{i}"
         st.markdown(f"#### {viz.get('title')} (`{viz.get('chart_type')}`)")
         fig_json = viz.get("plotly_json")
@@ -751,6 +747,84 @@ def render_charts_panel(ws: SharedWorkspace) -> None:
         elif viz.get("html_path"):
             st.caption(f"Chart artifact: `{viz['html_path']}`")
         st.caption(f"{viz.get('n_points')} data points · grounded={viz.get('grounded')}")
+
+
+def render_drafts_panel(ws: SharedWorkspace) -> None:
+    drafts = getattr(ws, "drafts", None) or []
+    if not drafts:
+        st.info("No drafts yet.")
+        return
+    from app.tools import export_tools
+
+    for i, item in enumerate(drafts, 1):
+        draft_id = str(item.get("id") or f"idx_{i}")
+        title = item.get("title") or f"Draft {i}"
+        st.markdown(f"#### {title} (`{item.get('type')}`)")
+        st.caption(
+            f"grounded={item.get('grounded')} · "
+            f"evidence_sufficient={item.get('evidence_sufficient')} · "
+            f"sources={len(item.get('source_artifacts') or [])}"
+        )
+        st.markdown(item.get("content") or "")
+        with st.expander("Sections / assumptions / warnings"):
+            st.json(
+                {
+                    "sections": item.get("sections"),
+                    "assumptions": item.get("assumptions"),
+                    "warnings": item.get("warnings"),
+                    "limitations": item.get("limitations"),
+                    "source_artifacts": item.get("source_artifacts"),
+                    "metadata": item.get("metadata"),
+                }
+            )
+
+        # Explicit export actions — do not auto-generate after every draft.
+        st.markdown("**Export**")
+        c_pdf, c_docx = st.columns(2)
+        pdf_err_key = f"draft_export_pdf_err_{draft_id}"
+        docx_err_key = f"draft_export_docx_err_{draft_id}"
+        pdf_data_key = f"draft_export_pdf_data_{draft_id}"
+        docx_data_key = f"draft_export_docx_data_{draft_id}"
+
+        with c_pdf:
+            if st.button("Export as PDF", key=f"btn_export_pdf_{draft_id}", use_container_width=True):
+                try:
+                    st.session_state[pdf_data_key] = export_tools.export_draft_pdf(item, ws)
+                    st.session_state[pdf_err_key] = None
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state[pdf_data_key] = None
+                    st.session_state[pdf_err_key] = str(exc)
+            if st.session_state.get(pdf_err_key):
+                st.error(f"PDF export failed: {st.session_state[pdf_err_key]}")
+            elif st.session_state.get(pdf_data_key):
+                st.download_button(
+                    "Download PDF",
+                    data=st.session_state[pdf_data_key],
+                    file_name=export_tools.safe_export_filename(str(title), "pdf"),
+                    mime="application/pdf",
+                    key=f"dl_pdf_{draft_id}",
+                    use_container_width=True,
+                )
+
+        with c_docx:
+            if st.button("Export as DOCX", key=f"btn_export_docx_{draft_id}", use_container_width=True):
+                try:
+                    st.session_state[docx_data_key] = export_tools.export_draft_docx(item, ws)
+                    st.session_state[docx_err_key] = None
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state[docx_data_key] = None
+                    st.session_state[docx_err_key] = str(exc)
+            if st.session_state.get(docx_err_key):
+                st.error(f"DOCX export failed: {st.session_state[docx_err_key]}")
+            elif st.session_state.get(docx_data_key):
+                st.download_button(
+                    "Download DOCX",
+                    data=st.session_state[docx_data_key],
+                    file_name=export_tools.safe_export_filename(str(title), "docx"),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"dl_docx_{draft_id}",
+                    use_container_width=True,
+                )
 
 
 def render_history_panel(ws: SharedWorkspace) -> None:
@@ -797,8 +871,9 @@ def render_toolkit_panel(demos: dict, ws: SharedWorkspace | None = None) -> None
 
     if not eda_block and not aggs_block and not charts_block:
         st.info(
-            "Nothing here yet. In the sidebar under **Try these new tools**, pick an option — "
-            "those prompts go through the Dataset, Analysis, and Visualization agents."
+            "Nothing here yet. In the sidebar under **Try another example**, start with "
+            "step 1 (generic synthetic dataset), then Explore / Summarize / Charts — "
+            "or use **Run all of the above**."
         )
         return
 
@@ -806,8 +881,7 @@ def render_toolkit_panel(demos: dict, ws: SharedWorkspace | None = None) -> None
         eda = eda_block
         st.markdown("#### How columns relate to each other")
         st.caption(
-            "Closer to 1 or −1 means a stronger link between two numbers "
-            "(quantity, unit price, and order total)."
+            "Closer to 1 or −1 means a stronger link between two numeric columns."
         )
         corr = eda.get("correlation") if isinstance(eda.get("correlation"), dict) else eda
         pairs = (corr or {}).get("pairs") or []
@@ -929,7 +1003,23 @@ def render_footer() -> None:
 
 def render_conversation(messages: list[dict]) -> None:
     if not messages:
-        st.caption("Ask in natural language, or pick an example from the sidebar.")
+        st.markdown('<div class="msg-role">Agents</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="msg-assistant">'
+            '<p><span class="msg-greeting-wave" aria-hidden="true">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+            'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M9 11.5V5.5a1.5 1.5 0 0 1 3 0V11"/>'
+            '<path d="M12 10.5V4.5a1.5 1.5 0 0 1 3 0V11"/>'
+            '<path d="M15 10.5V6.5a1.5 1.5 0 0 1 3 0v7.5a6 6 0 0 1-6 6h-1.5'
+            'a6.5 6.5 0 0 1-6.5-6.5V11a1.5 1.5 0 0 1 3 0v1.5"/>'
+            '<path d="M6 12.5V11a1.5 1.5 0 0 1 3 0v2"/>'
+            "</svg></span>"
+            "Hi — I'm your data analysis team. Ask me anything in natural language, "
+            "or pick an example from the sidebar to get started.</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         return
     for msg in messages:
         role = msg.get("role", "assistant")
@@ -1071,7 +1161,10 @@ def build_llm_from_session() -> LLMClient:
 
 def run_request(prompt: str) -> None:
     ws: SharedWorkspace = st.session_state.workspace
+    ctx: ConversationContext = st.session_state.conversation_context
     messages = list(st.session_state.messages)
+    # Recent window excludes the brand-new user turn; orchestrator receives it as user_request.
+    prior_messages = list(messages)
     messages.append({"role": "user", "content": prompt})
     events: list[dict] = []
 
@@ -1080,10 +1173,17 @@ def run_request(prompt: str) -> None:
 
     with st.spinner("Orchestrator coordinating agents…"):
         orch = Orchestrator(llm=build_llm_from_session())
-        ws = orch.run(prompt, workspace=ws, progress_callback=on_progress)
+        ws = orch.run(
+            prompt,
+            workspace=ws,
+            progress_callback=on_progress,
+            conversation_context=ctx,
+            recent_messages=prior_messages,
+        )
 
     messages.append({"role": "assistant", "content": ws.final_response or "Completed."})
     st.session_state.workspace = ws
+    st.session_state.conversation_context = ctx
     st.session_state.events = events
     st.session_state.messages = messages
 
@@ -1113,14 +1213,29 @@ def main() -> None:
             format_func=lambda pid: provider_labels[pid],
             key="llm_provider",
         )
+        prev_provider = st.session_state.get("_llm_provider_loaded")
         refresh_col, _ = st.columns([1, 2])
         with refresh_col:
             if st.button("Refresh models", use_container_width=True, key="llm_refresh_models"):
                 clear_model_cache(provider)
                 st.session_state.pop("llm_model", None)
+                st.session_state.pop("_llm_model_options", None)
 
-        with st.spinner("Loading latest models…"):
-            model_options = list_models(provider)
+        # Reload when provider changes or cached options are missing/stale.
+        cached_options = st.session_state.get("_llm_model_options")
+        need_reload = prev_provider != provider or not cached_options
+        if need_reload:
+            clear_model_cache(provider)
+            with st.spinner("Loading latest models…"):
+                # Hard-cap in the UI so the dropdown never exceeds 3 chat models.
+                model_options = list_models(provider, force_refresh=True)[:MAX_MODEL_CHOICES]
+            st.session_state._llm_model_options = model_options
+            st.session_state._llm_provider_loaded = provider
+            if "llm_model" in st.session_state and st.session_state.llm_model not in model_options:
+                st.session_state.pop("llm_model", None)
+        else:
+            model_options = list(cached_options)[:MAX_MODEL_CHOICES]
+
         latest = model_options[0] if model_options else latest_model_for(provider)
         if "llm_model" not in st.session_state or st.session_state.llm_model not in model_options:
             st.session_state.llm_model = latest
@@ -1128,7 +1243,7 @@ def main() -> None:
             "Model",
             options=model_options,
             key="llm_model",
-            help="Live list from the provider API, newest first. Default is the latest chat model.",
+            help="Latest 3 chat models from the provider API (newest first). Default is the newest.",
         )
         llm = build_llm_from_session()
         st.caption(llm.status_label)
@@ -1136,11 +1251,15 @@ def main() -> None:
             st.caption(f"Latest: `{latest}` · {len(model_options)} chat models")
         env_key = PROVIDERS[provider]["env_key"]
         if not llm.available:
-            st.caption(f"Set `{env_key}` in `.env` to enable this provider.")
+            st.error(
+                f"Live mode requires `{env_key}` in `.env`. "
+                "Without it, requests will fail instead of inventing data."
+            )
         st.link_button("Reset workspace", url="?reset=1", use_container_width=True, type="primary")
 
         st.divider()
         st.markdown("### Load CSV")
+        st.caption("Upload real data before analysis. Synthetic datasets are created only when you ask.")
         uploaded = st.file_uploader("Upload a CSV into the shared workspace", type=["csv"], key="csv_uploader")
         if uploaded is not None and st.button("Load into Dataset Agent", use_container_width=True, key="csv_load_btn"):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
@@ -1164,8 +1283,8 @@ def main() -> None:
         st.markdown("### Try an example")
         st.caption(
             "Steps don’t have to run in order, but create or load a dataset first "
-            "(step 1) so analysis, anomalies, and charts have data to work with — "
-            "or use the full workflow instead."
+            "(step 1) so analysis, anomalies, forecasts, charts, and drafts have "
+            "data to work with — or use the full workflow instead."
         )
         pending_from_example: str | None = None
         for i, (label, prompt) in enumerate(STEP_EXAMPLES, start=1):
@@ -1180,21 +1299,24 @@ def main() -> None:
             pending_from_example = full_prompt
 
         st.divider()
-        st.markdown("### Try these new tools")
-        for demo in TIER0_DEMOS:
-            st.markdown(
-                f"""
-                <div class="demo-card">
-                  <div class="demo-title">{demo["title"]}</div>
-                  <div class="demo-plain">{demo["plain"]}</div>
-                  <div class="demo-meta">{demo["jargon"]}</div>
-                  <div class="demo-agent">→ {demo["agents"]}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button("Run", use_container_width=True, key=f"tier0_demo_{demo['key']}"):
-                pending_from_example = demo["prompt"]
+        st.markdown("### Try another example")
+        st.caption(
+            "Same idea as above: create or load a dataset first (step 1), then run "
+            "Explore, category summaries, and the new chart types — or use the full "
+            "toolkit workflow instead."
+        )
+        for i, (label, prompt, meta) in enumerate(TOOLKIT_STEP_EXAMPLES, start=1):
+            if st.button(f"{i}. {label}", use_container_width=True, key=f"toolkit_step_{i}"):
+                pending_from_example = prompt
+            st.caption(meta)
+            if i < len(TOOLKIT_STEP_EXAMPLES):
+                st.markdown('<div class="example-arrow">↓</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="example-or">———— or ————</div>', unsafe_allow_html=True)
+        full_label, full_prompt, full_meta = TOOLKIT_FULL_EXAMPLE
+        if st.button(full_label, use_container_width=True, key="toolkit_full_workflow"):
+            pending_from_example = full_prompt
+        st.caption(full_meta)
 
     # Always bind panels to the latest session_state after callbacks (e.g. reset on_click)
     ws: SharedWorkspace = st.session_state.workspace
@@ -1280,26 +1402,41 @@ def main() -> None:
             render_anomaly_panel(ws)
         with tabs[4]:
             section_help(
-                "Charts",
+                "Forecasts",
                 TOUR_STEPS[4]["agent"],
                 TOUR_STEPS[4]["body"],
             )
-            render_charts_panel(ws)
+            render_forecast_panel(ws)
         with tabs[5]:
             section_help(
-                "Agent log",
+                "Charts",
                 TOUR_STEPS[5]["agent"],
                 TOUR_STEPS[5]["body"],
             )
-            render_history_panel(ws)
+            render_charts_panel(ws)
         with tabs[6]:
             section_help(
+                "Drafts",
+                TOUR_STEPS[6]["agent"],
+                TOUR_STEPS[6]["body"],
+            )
+            render_drafts_panel(ws)
+        with tabs[7]:
+            section_help(
+                "Agent log",
+                TOUR_STEPS[7]["agent"],
+                TOUR_STEPS[7]["body"],
+            )
+            render_history_panel(ws)
+        with tabs[8]:
+            section_help(
                 "Toolkit",
-                "Dataset · Analysis · Visualization agents",
+                "Dataset · Analysis · Forecasting · Visualization · Drafting agents",
                 (
                     "Results from the newer tools wired into agents: explore how columns relate, "
                     "find blank values and value ranges, summarize by category "
-                    "(spread, unique counts, percent share), and box / heat / dual charts."
+                    "(spread, unique counts, percent share), forecasts, drafts/reports, "
+                    "and box / heat / dual charts."
                 ),
             )
             render_toolkit_panel(dict(st.session_state.get("toolkit_demos") or {}), ws)

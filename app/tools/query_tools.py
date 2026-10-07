@@ -99,7 +99,9 @@ def execute_aggregation(
     group_by = coerce_column_ref(group_by)
     if group_by is not None and group_by not in df.columns:
         # Try case-insensitive / alias repair before failing
-        repaired = _resolve_column_name(df, group_by, ("product_category", "category", "state"))
+        repaired = _resolve_column_name(
+            df, group_by, ("category", "segment", "type", "group", "region", "state")
+        )
         if repaired is None:
             raise ValueError(f"Group-by column '{group_by}' not in dataset.")
         group_by = repaired
@@ -196,13 +198,15 @@ def _resolve_metric_column(df: pd.DataFrame, metric_column: str | None) -> str:
     metric_column = coerce_column_ref(metric_column)
     if metric_column and metric_column in df.columns:
         return metric_column
-    resolved = _resolve_column_name(
-        df,
-        metric_column,
-        ("total_amount", "revenue", "amount", "unit_price", "value", "price", "sales"),
-    )
-    if resolved:
-        return resolved
+    # Resolve user/LLM aliases against the live schema, then first numeric column.
+    if metric_column:
+        resolved = _resolve_column_name(
+            df,
+            metric_column,
+            ("revenue", "amount", "sales", "value", "price", "total"),
+        )
+        if resolved:
+            return resolved
     numeric = df.select_dtypes(include="number").columns.tolist()
     if numeric:
         return str(numeric[0])

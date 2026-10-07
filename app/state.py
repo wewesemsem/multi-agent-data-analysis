@@ -36,7 +36,9 @@ class SharedWorkspace:
     dataset: dict[str, Any] | None = None
     analysis_results: list[dict[str, Any]] = field(default_factory=list)
     anomalies: list[dict[str, Any]] = field(default_factory=list)
+    forecasts: list[dict[str, Any]] = field(default_factory=list)
     visualizations: list[dict[str, Any]] = field(default_factory=list)
+    drafts: list[dict[str, Any]] = field(default_factory=list)
     task_status: str = "idle"
     agent_history: list[dict[str, Any]] = field(default_factory=list)
     plan: list[dict[str, Any]] = field(default_factory=list)
@@ -50,7 +52,9 @@ class SharedWorkspace:
             "dataset": self.dataset,
             "analysis_results": self.analysis_results,
             "anomalies": self.anomalies,
+            "forecasts": self.forecasts,
             "visualizations": self.visualizations,
+            "drafts": self.drafts,
             "task_status": self.task_status,
             "agent_history": self.agent_history,
             "plan": self.plan,
